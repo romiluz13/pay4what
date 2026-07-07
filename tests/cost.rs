@@ -41,6 +41,7 @@ fn cost_prices_each_bucket_at_its_own_rate() {
         output_tokens: 1_000_000,
         cache_read_input_tokens: 1_000_000,
         cache_creation_input_tokens: 1_000_000,
+        ..Default::default()
     };
     let pricing = sample_pricing();
     // 1M of each bucket at the sample rates:
@@ -63,6 +64,7 @@ fn cost_does_not_double_count_cache() {
         output_tokens: 50,
         cache_read_input_tokens: 10_000,
         cache_creation_input_tokens: 0,
+        ..Default::default()
     };
     let pricing = sample_pricing();
     let cost = cost_for_usage(&usage, &pricing);
@@ -110,9 +112,55 @@ fn unknown_model_falls_back_gracefully() {
         output_tokens: 0,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        ..Default::default()
     };
     let pricing = sample_pricing();
     // unknown model -> cost 0 (tolerant; do NOT panic). Real impl will log a warning.
     let cost = cost_for_usage(&usage, &pricing);
     assert_eq!(cost, 0.0, "unknown model should yield $0, not panic");
+}
+
+/// 1h cache-creation is priced at input*2.0, NOT the flat cache_create rate.
+/// MIRROR: ccusage cost.rs:5 CACHE_CREATE_1H_INPUT_MULTIPLIER = 2.0.
+/// When the 5m/1h split is present, 5m uses cache_creation rate, 1h uses input*2.0.
+#[test]
+fn cache_creation_1h_priced_at_input_times_2() {
+    let usage = pay4what::parse::TurnUsage {
+        model: "claude-sonnet-4-6".into(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 1_000_000, // flat total (ignored when split present)
+        cache_creation_5m: Some(0),
+        cache_creation_1h: Some(1_000_000), // all 1h
+    };
+    let pricing = sample_pricing();
+    // 1M 1h-cache at input*2.0 = 1M/1M * 3.0 * 2.0 = $6.00
+    // (NOT 1M * 3.75 = $3.75 which would be the flat cache_create rate)
+    let cost = cost_for_usage(&usage, &pricing);
+    assert!(
+        (cost - 6.0).abs() < 1e-6,
+        "1h cache at input*2.0 = $6.00, got ${cost}"
+    );
+}
+
+/// When no 5m/1h split, all cache-creation uses the flat cache_create rate.
+#[test]
+fn cache_creation_flat_when_no_split() {
+    let usage = pay4what::parse::TurnUsage {
+        model: "claude-sonnet-4-6".into(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 1_000_000,
+        cache_creation_5m: None,
+        cache_creation_1h: None,
+    };
+    let pricing = sample_pricing();
+    // 1M at flat cache_create rate 3.75 = $3.75
+    let cost = cost_for_usage(&usage, &pricing);
+    assert!(
+        (cost - 3.75).abs() < 1e-6,
+        "flat cache_create = $3.75, got ${cost}"
+    );
 }

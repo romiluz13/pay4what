@@ -8,7 +8,7 @@
 //!   - subagent turns (isSidechain / agentId)
 //!   - compact boundaries
 //!   - cache tokens reported separate from input (never double-count)
-use pay4what::discover::discover_sessions;
+use pay4what::discover::{discover_sessions, discover_subagents};
 use pay4what::parse::parse_session;
 use std::fs;
 use std::io::Write;
@@ -120,4 +120,68 @@ fn exposes_cache_buckets_separately() {
     assert_eq!(u.cache_read_input_tokens, 5000);
     assert_eq!(u.cache_creation_input_tokens, 500);
     assert_eq!(u.output_tokens, 200);
+}
+
+/// The 5m/1h cache-creation split: when present, parser captures both.
+/// MIRROR: ccusage cost.rs:5 — 1h priced at input*2.0.
+#[test]
+fn parses_5m_1h_cache_creation_split() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("s.jsonl");
+    fs::write(
+        &p,
+        r#"{"type":"assistant","timestamp":"2026-07-07T10:00:00Z","message":{"role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":8152,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":8152}}}}"#,
+    )
+    .unwrap();
+    let s = parse_session(&p).unwrap();
+    let u = s.turns[0].usage.as_ref().unwrap();
+    assert_eq!(
+        u.cache_creation_input_tokens, 8152,
+        "flat total still captured"
+    );
+    assert_eq!(u.cache_creation_5m, Some(0));
+    assert_eq!(u.cache_creation_1h, Some(8152), "1h split captured");
+}
+
+/// Subagent discovery: given a top-level session file, find sibling
+/// `<uuid>/subagents/agent-*.jsonl` files. Skip workflows/journal.jsonl.
+/// MIRROR: verified against Rom's 1,885 local files — subagent turns live in
+/// separate files, NOT mixed into the parent session.
+#[test]
+fn discovers_subagent_files_for_session() {
+    let root = TempDir::new().unwrap();
+    let proj = root.path().join("-Users-x-Dev-foo");
+    fs::create_dir_all(&proj).unwrap();
+    let session = proj.join("abc123.jsonl");
+    fs::write(
+        &session,
+        r#"{"type":"user","timestamp":"2026-07-07T10:00:00Z"}"#,
+    )
+    .unwrap();
+    // subagent files under abc123/subagents/
+    let sub_dir = proj.join("abc123").join("subagents");
+    fs::create_dir_all(&sub_dir).unwrap();
+    let agent1 = sub_dir.join("agent-aabbcc.jsonl");
+    let agent2 = sub_dir.join("agent-ddeeff.jsonl");
+    let meta = sub_dir.join("agent-aabbcc.meta.json");
+    fs::write(&agent1, r#"{"isSidechain":true}"#).unwrap();
+    fs::write(&agent2, r#"{"isSidechain":true}"#).unwrap();
+    fs::write(&meta, r#"{}"#).unwrap();
+    // workflows journal — must be SKIPPED
+    let wf_dir = sub_dir.join("workflows").join("wf_123");
+    fs::create_dir_all(&wf_dir).unwrap();
+    fs::write(wf_dir.join("journal.jsonl"), r#"{}"#).unwrap();
+
+    let found = discover_subagents(&session);
+    assert_eq!(
+        found.len(),
+        2,
+        "should find 2 agent files, skip workflows journal + meta"
+    );
+    assert!(found.iter().all(|p| {
+        p.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("agent-")
+    }));
 }

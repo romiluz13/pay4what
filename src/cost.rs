@@ -30,22 +30,36 @@ pub struct PricingTable {
     pub models: HashMap<String, ModelPricing>,
 }
 
+/// 1h cache-creation is priced at 2.0x the INPUT rate (NOT the cache_create
+/// rate). MIRROR: ccusage cost.rs:5 `CACHE_CREATE_1H_INPUT_MULTIPLIER = 2.0`.
+const CACHE_CREATE_1H_INPUT_MULTIPLIER: f64 = 2.0;
+
 /// Compute USD cost for one turn's usage. Prices each token bucket at its OWN
 /// rate. NEVER double-counts: input_tokens is fresh (excludes cache), so the
 /// four terms are additive.
 ///
-/// Unknown model -> $0 (tolerant; caller may log a warning). This matches the
-/// handoff's "treat $0/empty as suspect" correction — unknown is NOT free, it's
-/// unpriced; the real CLI will surface a warning + skip the turn's cost.
+/// When the 5m/1h cache-creation split is present, 5m tokens are priced at the
+/// `cache_creation` rate and 1h tokens at `input * 2.0` (per ccusage). When no
+/// split, all cache-creation tokens are priced at the flat `cache_creation` rate.
+///
+/// Unknown model -> $0 (tolerant; caller may log a warning).
 pub fn cost_for_usage(usage: &TurnUsage, pricing: &PricingTable) -> f64 {
     let Some(mp) = pricing.models.get(&usage.model) else {
         return 0.0;
     };
     let per_mtok = 1_000_000.0;
+
+    // cache-creation: use 5m/1h split if present, else flat total.
+    let (cc_5m, cc_1h) = match (usage.cache_creation_5m, usage.cache_creation_1h) {
+        (Some(m5), Some(h1)) => (m5 as f64, h1 as f64),
+        _ => (usage.cache_creation_input_tokens as f64, 0.0),
+    };
+
     (usage.input_tokens as f64 / per_mtok) * mp.input_per_mtok
         + (usage.output_tokens as f64 / per_mtok) * mp.output_per_mtok
         + (usage.cache_read_input_tokens as f64 / per_mtok) * mp.cache_read_per_mtok
-        + (usage.cache_creation_input_tokens as f64 / per_mtok) * mp.cache_creation_per_mtok
+        + (cc_5m / per_mtok) * mp.cache_creation_per_mtok
+        + (cc_1h / per_mtok) * (mp.input_per_mtok * CACHE_CREATE_1H_INPUT_MULTIPLIER)
 }
 
 /// Sum cost across all turns in a session that carry usage. Turns without usage

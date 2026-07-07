@@ -1,14 +1,15 @@
 // Quick dogfood: parse one REAL local session, report what we got.
 use pay4what::cost::{bundled_pricing, cost_for_session};
-use pay4what::discover::discover_all;
+use pay4what::discover::{discover_all, discover_subagents};
 use pay4what::parse::parse_session;
 fn main() {
     let sessions = discover_all();
     println!("discovered {} sessions", sessions.len());
-    // pick a SDR-AI session (real dev repo with 777 commits)
+    // pick a session that HAS subagents (sql-hidden-cost benchmark workspace)
     let sdr = sessions
         .iter()
-        .find(|p| p.to_string_lossy().contains("SDR-AI"))
+        .filter(|p| discover_subagents(p).len() > 0)
+        .max_by_key(|p| discover_subagents(p).len())
         .unwrap();
     let s = parse_session(sdr).unwrap();
     println!("session: {}", s.path.file_name().unwrap().to_string_lossy());
@@ -49,4 +50,17 @@ fn main() {
     let pricing = bundled_pricing();
     let cost = cost_for_session(&s, &pricing);
     println!("  COST:   ${:.4}  (pricing as-of {})", cost, pricing.as_of);
+
+    // subagent discovery + cost
+    let subs = discover_subagents(sdr);
+    let mut sub_cost = 0.0;
+    let mut sub_turns = 0u64;
+    for sub_path in &subs {
+        if let Ok(sub_session) = parse_session(sub_path) {
+            sub_turns += sub_session.turns.len() as u64;
+            sub_cost += cost_for_session(&sub_session, &pricing);
+        }
+    }
+    println!("  subagents: {} files, {} turns, ${:.4} cost", subs.len(), sub_turns, sub_cost);
+    println!("  TOTAL (parent+sub): ${:.4}", cost + sub_cost);
 }

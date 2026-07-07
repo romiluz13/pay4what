@@ -12,6 +12,11 @@ use std::path::Path;
 /// MIRROR: agent-usage.mjs:54-66: input_tokens / cache_read_input_tokens /
 /// cache_creation_input_tokens are distinct; `tokensRead = input + cache_read +
 /// cache_creation` (but cost prices each bucket at its OWN rate).
+///
+/// `cache_creation` can carry a 5m/1h split (ccusage cost.rs:5 — 1h priced at
+/// input*2.0, NOT the flat cache_create rate). When the split is present,
+/// `cache_creation_input_tokens` is the FLAT total and the split overrides it
+/// for cost math (the same tokens are never counted both ways).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TurnUsage {
     pub model: String,
@@ -19,6 +24,10 @@ pub struct TurnUsage {
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    /// Optional 5m/1h breakdown of cache_creation. When present, cost math uses
+    /// these instead of the flat total (1h priced at input*2.0 per ccusage).
+    pub cache_creation_5m: Option<u64>,
+    pub cache_creation_1h: Option<u64>,
 }
 
 /// One parsed JSONL line (a turn). Fields are optional — volatile schema.
@@ -70,12 +79,26 @@ fn parse_line(line: &str) -> Option<Turn> {
         // usage block actually exists — a turn with a model but no usage stays
         // usage=None (per spec; model-mix is derived from turns that DO have usage).
         if let (Some(model), Some(u)) = (str_of(msg, "model"), msg.get("usage")) {
+            // 5m/1h cache-creation split (ccusage cost.rs:5 — 1h priced at input*2.0)
+            let cc_split = u.get("cache_creation").and_then(|c| c.as_object());
+            let (cc_5m, cc_1h) = if let Some(obj) = cc_split {
+                (
+                    obj.get("ephemeral_5m_input_tokens")
+                        .and_then(|x| x.as_u64()),
+                    obj.get("ephemeral_1h_input_tokens")
+                        .and_then(|x| x.as_u64()),
+                )
+            } else {
+                (None, None)
+            };
             usage = Some(TurnUsage {
                 model,
                 input_tokens: u64_of(u, "input_tokens"),
                 output_tokens: u64_of(u, "output_tokens"),
                 cache_read_input_tokens: u64_of(u, "cache_read_input_tokens"),
                 cache_creation_input_tokens: u64_of(u, "cache_creation_input_tokens"),
+                cache_creation_5m: cc_5m,
+                cache_creation_1h: cc_1h,
             });
         }
         // tool_use blocks live in message.content[]
