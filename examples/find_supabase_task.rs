@@ -2,7 +2,7 @@
 use pay4what::parse::parse_session;
 use std::path::PathBuf;
 
-fn scan_session_user_msgs(path: &PathBuf) -> Vec<(String, String)> {
+fn scan_session_user_msgs(path: &std::path::Path) -> Vec<(String, String)> {
     // returns (timestamp, text) for real user messages
     let Ok(s) = parse_session(path) else {
         return vec![];

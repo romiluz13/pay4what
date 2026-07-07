@@ -80,8 +80,8 @@ fn main() {
             mongo_scores.push((mongo, p.clone()));
         }
     }
-    supabase_scores.sort_by(|a, b| b.0.cmp(&a.0));
-    mongo_scores.sort_by(|a, b| b.0.cmp(&a.0));
+    supabase_scores.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+    mongo_scores.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
 
     println!("== Top Supabase-mentioning sessions ==");
     for (n, p) in supabase_scores.iter().take(5) {
