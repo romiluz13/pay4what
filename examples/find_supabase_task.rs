@@ -1,6 +1,5 @@
 //! Find the actual Supabase-task user message + identify a clean Supabase-focused session.
 use pay4what::parse::parse_session;
-use std::path::PathBuf;
 
 fn scan_session_user_msgs(path: &std::path::Path) -> Vec<(String, String)> {
     // returns (timestamp, text) for real user messages
