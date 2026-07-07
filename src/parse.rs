@@ -42,6 +42,7 @@ pub struct Turn {
     pub parent_uuid: Option<String>, // parentUuid (conversation tree)
     pub usage: Option<TurnUsage>,    // message.usage (assistant turns only)
     pub tool_uses: Vec<ToolUse>,     // message.content[].tool_use
+    pub text: Option<String>,        // message.content as string or first text block
 }
 
 #[derive(Debug, Clone, Default)]
@@ -74,6 +75,7 @@ fn parse_line(line: &str) -> Option<Turn> {
     let v: Value = serde_json::from_str(line).ok()?;
     let mut tool_uses = Vec::new();
     let mut usage = None;
+    let mut text = None;
     if let Some(msg) = v.get("message") {
         // usage lives on message for assistant turns. Only set usage when the
         // usage block actually exists — a turn with a model but no usage stays
@@ -102,17 +104,34 @@ fn parse_line(line: &str) -> Option<Turn> {
             });
         }
         // tool_use blocks live in message.content[]
-        if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-            for block in content {
-                if block.get("type").and_then(|x| x.as_str()) == Some("tool_use") {
-                    tool_uses.push(ToolUse {
-                        name: block
-                            .get("name")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        input: block.get("input").cloned().unwrap_or(Value::Null),
-                    });
+        if let Some(content) = msg.get("content") {
+            // content can be a string (user request) or an array of blocks
+            if let Some(s) = content.as_str() {
+                if !s.is_empty() {
+                    text = Some(s.to_string());
+                }
+            } else if let Some(arr) = content.as_array() {
+                // first text block (skip tool_result continuations)
+                for block in arr {
+                    if block.get("type").and_then(|x| x.as_str()) == Some("text")
+                        && let Some(t) = block.get("text").and_then(|x| x.as_str())
+                        && !t.is_empty()
+                    {
+                        text = Some(t.to_string());
+                        break;
+                    }
+                }
+                for block in arr {
+                    if block.get("type").and_then(|x| x.as_str()) == Some("tool_use") {
+                        tool_uses.push(ToolUse {
+                            name: block
+                                .get("name")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            input: block.get("input").cloned().unwrap_or(Value::Null),
+                        });
+                    }
                 }
             }
         }
@@ -130,6 +149,7 @@ fn parse_line(line: &str) -> Option<Turn> {
         parent_uuid: str_of(&v, "parentUuid"),
         usage,
         tool_uses,
+        text,
     })
 }
 

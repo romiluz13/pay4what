@@ -8,7 +8,7 @@ fn main() {
     // pick a session that HAS subagents (sql-hidden-cost benchmark workspace)
     let sdr = sessions
         .iter()
-        .filter(|p| discover_subagents(p).len() > 0)
+        .filter(|p| !discover_subagents(p).is_empty())
         .max_by_key(|p| discover_subagents(p).len())
         .unwrap();
     let s = parse_session(sdr).unwrap();
@@ -61,6 +61,11 @@ fn main() {
             sub_cost += cost_for_session(&sub_session, &pricing);
         }
     }
-    println!("  subagents: {} files, {} turns, ${:.4} cost", subs.len(), sub_turns, sub_cost);
+    println!(
+        "  subagents: {} files, {} turns, ${:.4} cost",
+        subs.len(),
+        sub_turns,
+        sub_cost
+    );
     println!("  TOTAL (parent+sub): ${:.4}", cost + sub_cost);
 }
