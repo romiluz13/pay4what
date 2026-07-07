@@ -1,4 +1,5 @@
 // Quick dogfood: parse one REAL local session, report what we got.
+use pay4what::cost::{bundled_pricing, cost_for_session};
 use pay4what::discover::discover_all;
 use pay4what::parse::parse_session;
 fn main() {
@@ -45,4 +46,7 @@ fn main() {
         "  tokens: input={} output={} cache_read={} cache_creation={}",
         inp, out, cr, cc
     );
+    let pricing = bundled_pricing();
+    let cost = cost_for_session(&s, &pricing);
+    println!("  COST:   ${:.4}  (pricing as-of {})", cost, pricing.as_of);
 }
