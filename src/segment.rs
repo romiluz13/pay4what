@@ -34,6 +34,24 @@ pub struct Segment {
     pub tool_verbs: BTreeSet<String>,
 }
 
+impl Segment {
+    /// Total tokens consumed by this segment (input + output + cache_read +
+    /// cache_creation across all assistant turns with usage). For the viral
+    /// table's Tokens column.
+    pub fn total_tokens(&self) -> u64 {
+        self.turns
+            .iter()
+            .filter_map(|t| t.usage.as_ref())
+            .map(|u| {
+                u.input_tokens
+                    + u.output_tokens
+                    + u.cache_read_input_tokens
+                    + u.cache_creation_input_tokens
+            })
+            .sum()
+    }
+}
+
 /// Edit/Write tool names whose `input` carries a file path.
 const FILE_EDIT_TOOLS: &[&str] = &[
     "Edit",

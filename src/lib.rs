@@ -3,4 +3,5 @@ pub mod categorize;
 pub mod cost;
 pub mod discover;
 pub mod parse;
+pub mod render;
 pub mod segment;

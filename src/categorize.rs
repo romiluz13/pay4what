@@ -15,7 +15,7 @@ use crate::segment::Segment;
 use std::collections::BTreeSet;
 
 /// The activity categories pay4what attributes spend to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Activity {
     Feature,
     Bugfix,
@@ -78,6 +78,7 @@ pub struct LabeledSegment {
     pub activity: Activity,
     pub user_message: String,
     pub cost: f64,
+    pub tokens: u64,
     pub git_branch: Option<String>,
     pub touched_files: BTreeSet<String>,
 }
@@ -343,6 +344,7 @@ pub fn categorize_segments(segments: &[Segment], cat: &dyn Categorizer) -> Vec<L
             activity,
             user_message: seg.user_message.clone(),
             cost: seg.cost,
+            tokens: seg.total_tokens(),
             git_branch: seg.git_branch.clone(),
             touched_files: seg.touched_files.clone(),
         })

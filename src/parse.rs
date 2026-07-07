@@ -107,15 +107,19 @@ fn parse_line(line: &str) -> Option<Turn> {
         if let Some(content) = msg.get("content") {
             // content can be a string (user request) or an array of blocks
             if let Some(s) = content.as_str() {
-                if !s.is_empty() {
+                if !s.is_empty() && !s.starts_with('<') {
                     text = Some(s.to_string());
                 }
             } else if let Some(arr) = content.as_array() {
                 // first text block (skip tool_result continuations)
+                // first text block (skip tool_result continuations AND injected
+                // local-command markers — Claude Code wraps command output/caveats
+                // in <local-command-*> tags; those are NOT user requests)
                 for block in arr {
                     if block.get("type").and_then(|x| x.as_str()) == Some("text")
                         && let Some(t) = block.get("text").and_then(|x| x.as_str())
                         && !t.is_empty()
+                        && !t.starts_with("<local-command-")
                     {
                         text = Some(t.to_string());
                         break;
