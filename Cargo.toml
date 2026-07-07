@@ -1,0 +1,28 @@
+[package]
+name = "pay4what"
+version = "0.1.0"
+license = "MIT"
+description = "See what each feature cost you in Claude Code — token spend per activity, not per session."
+repository = "https://github.com/romiluz13/pay4what"
+edition = "2024"
+
+[dependencies]
+# JSONL streaming parse (tolerant of missing/volatile fields)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# CLI
+clap = { version = "4", features = ["derive"] }
+# Paths / home dir
+dirs = "6"
+# HTTP for OpenRouter categorizer (Task 5) — added now so cargo check covers it
+reqwest = { version = "0.12", features = ["blocking", "json"], default-features = false, optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+
+[features]
+default = ["categorize"]
+categorize = ["dep:reqwest", "dep:tokio"]
+
+[dev-dependencies]
+# Snapshot/property tests
+assert_cmd = "2"
+tempfile = "3"
