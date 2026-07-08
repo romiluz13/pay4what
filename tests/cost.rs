@@ -123,6 +123,50 @@ fn unknown_model_falls_back_gracefully() {
 /// 1h cache-creation is priced at input*2.0, NOT the flat cache_create rate.
 /// MIRROR: ccusage cost.rs:5 CACHE_CREATE_1H_INPUT_MULTIPLIER = 2.0.
 /// When the 5m/1h split is present, 5m uses cache_creation rate, 1h uses input*2.0.
+/// Chunked-turn dedup: Claude Code emits one logical turn as multiple JSONL
+/// lines (thinking/text/tool_use) sharing identical cumulative usage.
+/// cost_for_session must count each logical turn ONCE, not sum every chunk.
+#[test]
+fn cost_for_session_dedups_chunked_turns() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("s.jsonl");
+    fs::write(
+        &p,
+        [
+            r#"{"type":"assistant","timestamp":"2026-07-07T10:00:05Z","message":{"role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"thinking"}],"usage":{"input_tokens":2,"output_tokens":490,"cache_read_input_tokens":17926,"cache_creation_input_tokens":4912}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-07-07T10:00:05Z","message":{"role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text"}],"usage":{"input_tokens":2,"output_tokens":490,"cache_read_input_tokens":17926,"cache_creation_input_tokens":4912}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-07-07T10:00:08Z","message":{"role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"tool_use","name":"Read"}],"usage":{"input_tokens":2,"output_tokens":490,"cache_read_input_tokens":17926,"cache_creation_input_tokens":4912}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-07-07T10:00:20Z","message":{"role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":100,"cache_read_input_tokens":20000,"cache_creation_input_tokens":0}}}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let session = parse_session(&p).unwrap();
+    let pricing = sample_pricing();
+    let cost = cost_for_session(&session, &pricing);
+    let u1 = pay4what::parse::TurnUsage {
+        model: "claude-sonnet-4-6".into(),
+        input_tokens: 2,
+        output_tokens: 490,
+        cache_read_input_tokens: 17926,
+        cache_creation_input_tokens: 4912,
+        ..Default::default()
+    };
+    let u2 = pay4what::parse::TurnUsage {
+        model: "claude-sonnet-4-6".into(),
+        input_tokens: 10,
+        output_tokens: 100,
+        cache_read_input_tokens: 20000,
+        cache_creation_input_tokens: 0,
+        ..Default::default()
+    };
+    let expected = cost_for_usage(&u1, &pricing) + cost_for_usage(&u2, &pricing);
+    assert!(
+        (cost - expected).abs() < 1e-9,
+        "dedup: expected ${expected}, got ${cost}"
+    );
+}
+
 #[test]
 fn cache_creation_1h_priced_at_input_times_2() {
     let usage = pay4what::parse::TurnUsage {

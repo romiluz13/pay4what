@@ -8,7 +8,7 @@
 //! Source: LiteLLM pricing snapshot, asOf-dated for reproducibility.
 use std::collections::HashMap;
 
-use crate::parse::{Session, TurnUsage};
+use crate::parse::{Session, Turn, TurnUsage};
 
 /// Per-model pricing in USD per million tokens. Cache rates are FIRST-CLASS —
 /// Claude reports cache_read/cache_creation separate from fresh input, and each
@@ -62,13 +62,38 @@ pub fn cost_for_usage(usage: &TurnUsage, pricing: &PricingTable) -> f64 {
         + (cc_1h / per_mtok) * (mp.input_per_mtok * CACHE_CREATE_1H_INPUT_MULTIPLIER)
 }
 
-/// Sum cost across all turns in a session that carry usage. Turns without usage
-/// contribute $0 (they're typically user/system turns).
+/// Iterate usage-bearing turns with chunk-duplicate dedup. Yields the first
+/// usage of each run of consecutive assistant turns sharing an identical
+/// usage tuple (Claude Code emits thinking+text+tool_use as separate lines
+/// with the same cumulative usage — summing them double-counts).
+pub fn dedup_usage_iter(turns: &[Turn]) -> impl Iterator<Item = &TurnUsage> {
+    let mut last_key: Option<(u64, u64, u64, u64)> = None;
+    turns.iter().filter_map(move |t| {
+        let u = t.usage.as_ref()?;
+        let key = (
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
+        );
+        if Some(key) == last_key {
+            None
+        } else {
+            last_key = Some(key);
+            Some(u)
+        }
+    })
+}
+
+/// Sum cost across all LOGICAL turns in a session that carry usage.
+///
+/// Claude Code emits one logical assistant turn as multiple JSONL lines
+/// (a thinking block, a text block, a tool_use block) that ALL share the
+/// same cumulative `message.usage`. Summing every line double/triple-counts.
+/// Dedup via `dedup_usage_iter`. (Verified against Rom's 27K-turn session:
+/// 10,648 usage lines -> 4,998 logical turns; without dedup, 113% inflation.)
 pub fn cost_for_session(session: &Session, pricing: &PricingTable) -> f64 {
-    session
-        .turns
-        .iter()
-        .filter_map(|t| t.usage.as_ref())
+    dedup_usage_iter(&session.turns)
         .map(|u| cost_for_usage(u, pricing))
         .sum()
 }

@@ -12,7 +12,7 @@
 //! (type:summary) start a new segment too.
 use std::collections::BTreeSet;
 
-use crate::cost::{PricingTable, cost_for_usage};
+use crate::cost::PricingTable;
 use crate::parse::{Session, Turn};
 
 /// One segment of work: a user message + the assistant turns that answer it.
@@ -36,12 +36,10 @@ pub struct Segment {
 
 impl Segment {
     /// Total tokens consumed by this segment (input + output + cache_read +
-    /// cache_creation across all assistant turns with usage). For the viral
-    /// table's Tokens column.
+    /// cache_creation across all LOGICAL assistant turns — chunk-deduped so
+    /// thinking+text+tool_use chunks of one turn count once, not 3×).
     pub fn total_tokens(&self) -> u64 {
-        self.turns
-            .iter()
-            .filter_map(|t| t.usage.as_ref())
+        crate::cost::dedup_usage_iter(&self.turns)
             .map(|u| {
                 u.input_tokens
                     + u.output_tokens
@@ -155,11 +153,8 @@ pub fn segment_session_with_pricing(session: &Session, pricing: &PricingTable) -
 }
 
 fn finalize_segment(seg: &mut Segment, pricing: &PricingTable) {
-    seg.cost = seg
-        .turns
-        .iter()
-        .filter_map(|t| t.usage.as_ref())
-        .map(|u| cost_for_usage(u, pricing))
+    seg.cost = crate::cost::dedup_usage_iter(&seg.turns)
+        .map(|u| crate::cost::cost_for_usage(u, pricing))
         .sum();
 }
 
