@@ -29,6 +29,11 @@ struct Cli {
     /// Also show the cost-by-file table.
     #[arg(long)]
     files: bool,
+
+    /// Skip the LLM categorizer (rules only). Fast, no API key needed.
+    /// Use this for quick cost totals; the LLM sharpens unattributed segments.
+    #[arg(long)]
+    no_llm: bool,
 }
 
 fn main() {
@@ -53,7 +58,12 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mut total_sessions = 0usize;
     let mut total_subagent_files = 0usize;
 
-    let categorizer = pick_categorizer(&cli.model);
+    let categorizer = if cli.no_llm {
+        Box::new(pay4what::categorize::RulesCategorizer)
+            as Box<dyn pay4what::categorize::Categorizer>
+    } else {
+        pick_categorizer(&cli.model)
+    };
 
     for session_path in &sessions {
         let Ok(session) = pay4what::parse::parse_session(session_path) else {

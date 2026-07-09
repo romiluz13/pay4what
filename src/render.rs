@@ -35,7 +35,19 @@ fn aggregate_by_activity(segments: &[LabeledSegment]) -> Vec<ActivityRow> {
         // keep the first non-empty description; if multiple segments share an
         // activity, note the count (e.g. "OAuth rotation (+1 more)")
         if row.description.is_empty() {
-            row.description = s.user_message.clone();
+            // fallback for segments with no captured user message: derive a
+            // description from touched files / tool verbs so the row isn't blank
+            row.description = if !s.user_message.is_empty() {
+                s.user_message.clone()
+            } else if let Some(f) = s.touched_files.iter().next() {
+                truncate(f, 36)
+            } else {
+                format!(
+                    "({} segment{})",
+                    s.activity.label(),
+                    if s.index > 1 { "s" } else { "" }
+                )
+            };
         } else if row.count == 2 {
             row.description = format!("{} (+1 more)", truncate(&row.description, 40));
         }
@@ -130,19 +142,25 @@ pub fn render_activity_table(segments: &[LabeledSegment]) -> String {
 
 /// Render the cost-by-file/area table (the second v1.0 view).
 pub fn render_file_table(segments: &[LabeledSegment]) -> String {
-    let mut by_file: BTreeMap<String, (f64, u64)> = BTreeMap::new();
+    // Aggregate by lowercased path (case-insensitive: /Dev/SDR-AI and
+    // /dev/sdr-ai are the same repo). Keep the first-seen original casing for display.
+    let mut by_file: BTreeMap<String, (f64, u64, String)> = BTreeMap::new();
     for s in segments {
         for f in &s.touched_files {
-            let e = by_file.entry(f.clone()).or_insert((0.0, 0));
+            let key = f.to_lowercase();
+            let e = by_file.entry(key).or_insert((0.0, 0, f.clone()));
             e.0 += s.cost / s.touched_files.len().max(1) as f64;
             e.1 += s.tokens;
+            // keep the first-seen display casing (don't overwrite)
         }
     }
     if by_file.is_empty() {
         return "No files touched in range.\n".to_string();
     }
-    let mut entries: Vec<(String, f64, u64)> =
-        by_file.into_iter().map(|(f, (c, t))| (f, c, t)).collect();
+    let mut entries: Vec<(String, f64, u64)> = by_file
+        .into_iter()
+        .map(|(_, (c, t, disp))| (disp, c, t))
+        .collect();
     entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut out = String::new();

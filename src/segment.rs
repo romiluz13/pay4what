@@ -70,6 +70,18 @@ fn extract_file_path(tool_name: &str, input: &serde_json::Value) -> Option<Strin
         .or_else(|| input.get("path"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+        .filter(|p| !is_memory_or_session_file(p))
+}
+
+/// Claude Code maintains memory files under `.claude/projects/<enc-cwd>/memory/`
+/// (MEMORY.md, project_*.md) and journal files under `subagents/workflows/`.
+/// These are bookkeeping the agent reads/writes, NOT source files the user's
+/// task targets. Exclude them from cost-by-file so the table reflects actual
+/// work, not memory maintenance.
+fn is_memory_or_session_file(path: &str) -> bool {
+    (path.contains("/.claude/projects/")
+        && (path.contains("/memory/") || path.contains("/subagents/")))
+        || path.contains("/subagents/workflows/")
 }
 
 /// Segment a session at user-turn boundaries. A new segment starts at each
