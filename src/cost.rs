@@ -98,20 +98,25 @@ pub fn cost_for_session(session: &Session, pricing: &PricingTable) -> f64 {
         .sum()
 }
 
-/// Bundled default pricing table (LiteLLM-sourced snapshot, asOf 2026-07-07).
+/// Bundled default pricing table (LiteLLM-sourced snapshot, asOf 2026-07-08).
 /// Includes cache rates — the gap ccusage's table has.
 ///
-/// Rates are Anthropic API list prices for the Claude models seen in Rom's
-/// local transcripts (sonnet-4-6, opus-4-8, haiku-4-5). Verify against
-/// anthropic.com/pricing before publishing claims (AGENTS.md: $0 may be a bug).
+/// VERIFIED 2026-07-08 vs https://docs.claude.com/en/docs/about-claude/pricing
+/// (primary source, read verbatim). Multiplier structure confirmed on the
+/// Opus 4.8 row: cache_creation_5m = 1.25× input, cache_read = 0.1× input.
+/// 1h cache writes = 2.0× input (handled in cost.rs, not stored here).
+///
+/// DO NOT use legacy Claude 3 Opus / Opus 4.1 rates ($15/$75) — deprecated.
+/// DO NOT use legacy Claude 3.5 Haiku rates ($0.8/$4) — deprecated.
 pub fn bundled_pricing() -> PricingTable {
     PricingTable {
-        as_of: "2026-07-07".into(),
+        as_of: "2026-07-08".into(),
         models: [
+            // (model, input, output, cache_read=0.1×in, cache_creation_5m=1.25×in)
             ("claude-sonnet-4-6", 3.0, 15.0, 0.30, 3.75),
-            ("claude-opus-4-8", 15.0, 75.0, 1.50, 18.75),
-            ("claude-haiku-4-5", 0.80, 4.0, 0.08, 1.0),
-            ("claude-haiku-4-5-20251001", 0.80, 4.0, 0.08, 1.0),
+            ("claude-opus-4-8", 5.0, 25.0, 0.50, 6.25),
+            ("claude-haiku-4-5", 1.0, 5.0, 0.10, 1.25),
+            ("claude-haiku-4-5-20251001", 1.0, 5.0, 0.10, 1.25),
         ]
         .into_iter()
         .map(|(m, i, o, cr, cc)| {

@@ -21,9 +21,9 @@ struct Cli {
     #[arg(long, default_value = "table")]
     format: String,
 
-    /// Categorizer model (OpenRouter). Default: deepseek/deepseek-v4-flash.
-    /// Falls back to rules if OPENROUTER_API_KEY is unset.
-    #[arg(long, default_value = "deepseek/deepseek-v4-flash")]
+    /// Categorizer model. Default: DeepSeek-V4-Flash (Grove). For OpenRouter,
+    /// pass e.g. `deepseek/deepseek-v4-flash`. Falls back to rules if no key.
+    #[arg(long, default_value = "DeepSeek-V4-Flash")]
     model: String,
 
     /// Also show the cost-by-file table.
@@ -114,20 +114,36 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Pick the categorizer: LLM if OPENROUTER_API_KEY is set, else rules fallback.
+/// Pick the categorizer: prefer Grove (Rom's personal gateway) when its env
+/// is set, else OpenRouter (the public-path default) when its key is set, else
+/// rules fallback. Published app uses OpenRouter; Grove is for local dogfooding.
 fn pick_categorizer(model: &str) -> Box<dyn pay4what::categorize::Categorizer> {
-    if std::env::var("OPENROUTER_API_KEY").is_ok() {
-        #[cfg(feature = "categorize")]
-        {
+    #[cfg(feature = "categorize")]
+    {
+        if let (Ok(key), Ok(base)) = (
+            std::env::var("GROVE_API_KEY"),
+            std::env::var("GROVE_BASE_URL"),
+        ) {
+            return Box::new(pay4what::categorize::LlmCategorizer::new(
+                model,
+                Box::new(pay4what::categorize::GroveCaller {
+                    api_key: key,
+                    base_url: base,
+                    model: model.to_string(),
+                }),
+            ));
+        }
+        if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
             return Box::new(pay4what::categorize::LlmCategorizer::new(
                 model,
                 Box::new(pay4what::categorize::OpenRouterCaller {
-                    api_key: std::env::var("OPENROUTER_API_KEY").unwrap_or_default(),
+                    api_key: key,
                     model: model.to_string(),
                 }),
             ));
         }
     }
+    let _ = model;
     Box::new(pay4what::categorize::RulesCategorizer)
 }
 

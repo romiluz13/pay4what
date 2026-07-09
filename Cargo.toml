@@ -15,7 +15,7 @@ clap = { version = "4", features = ["derive"] }
 # Paths / home dir
 dirs = "6"
 # HTTP for OpenRouter categorizer (Task 5) — added now so cargo check covers it
-reqwest = { version = "0.12", features = ["blocking", "json"], default-features = false, optional = true }
+reqwest = { version = "0.12", features = ["blocking", "json", "native-tls"], default-features = false, optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 
 [features]

@@ -225,7 +225,7 @@ impl LlmCategorizer {
     }
 
     /// Build the OpenRouter prompt for a batch of segments.
-    fn build_prompt(&self, segments: &[Segment]) -> String {
+    pub fn build_prompt(&self, segments: &[Segment]) -> String {
         let items: Vec<String> = segments
             .iter()
             .map(|s| {
@@ -248,8 +248,18 @@ impl LlmCategorizer {
         )
     }
 
-    fn parse_labels(text: &str) -> Vec<Activity> {
-        // parse {"labels":[...]} ; fall back to per-line parsing
+    pub fn parse_labels(text: &str) -> Vec<Activity> {
+        // Strip a markdown code fence if present (LLMs often wrap JSON in ```json ... ```)
+        let text = text.trim();
+        let text = text
+            .strip_prefix("```")
+            .map(|t| t.strip_prefix("json").unwrap_or(t).trim_start())
+            .unwrap_or(text);
+        let text = text
+            .strip_suffix("```")
+            .map(|t| t.trim_end())
+            .unwrap_or(text);
+        // Try the simple path first: the WHOLE text is a JSON object with a labels array.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(text)
             && let Some(arr) = v.get("labels").and_then(|l| l.as_array())
         {
@@ -259,7 +269,20 @@ impl LlmCategorizer {
                 .map(Activity::parse)
                 .collect();
         }
-        // fall back: split by comma/newline
+        // Fall back: extract the first {...} block and try again.
+        if let Some(start) = text.find('{')
+            && let Some(end) = text.rfind('}')
+            && start < end
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text[start..=end])
+            && let Some(arr) = v.get("labels").and_then(|l| l.as_array())
+        {
+            return arr
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(Activity::parse)
+                .collect();
+        }
+        // Last resort: split by comma/newline (rarely reached now).
         text.split([',', '\n']).map(Activity::parse).collect()
     }
 }
@@ -275,19 +298,26 @@ impl Categorizer for LlmCategorizer {
         if segments.is_empty() {
             return Vec::new();
         }
-        let prompt = self.build_prompt(segments);
-        match self.caller.categorize_batch(&prompt) {
-            Ok(text) => {
-                let labels = Self::parse_labels(&text);
-                // if the LLM returned the wrong count or was unparseable, fall back to rules
-                if labels.len() == segments.len() {
-                    labels
-                } else {
-                    segments.iter().map(|s| self.rules.categorize(s)).collect()
+        // Batch all segments in chunks of 20 to keep prompts small. Fall back to
+        // rules on any error or count mismatch. (Model choice is a runtime concern —
+        // the categorizer itself stays model-agnostic.)
+        let mut out = Vec::with_capacity(segments.len());
+        for chunk in segments.chunks(20) {
+            let prompt = self.build_prompt(chunk);
+            let labels = match self.caller.categorize_batch(&prompt) {
+                Ok(text) => {
+                    let parsed = Self::parse_labels(&text);
+                    if parsed.len() == chunk.len() {
+                        parsed
+                    } else {
+                        chunk.iter().map(|s| self.rules.categorize(s)).collect()
+                    }
                 }
-            }
-            Err(_) => segments.iter().map(|s| self.rules.categorize(s)).collect(),
+                Err(_) => chunk.iter().map(|s| self.rules.categorize(s)).collect(),
+            };
+            out.extend(labels);
         }
+        out
     }
 }
 
@@ -302,28 +332,93 @@ pub struct OpenRouterCaller {
 impl LlmCaller for OpenRouterCaller {
     fn categorize_batch(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent("pay4what/0.1")
             .build()?;
         let body = serde_json::json!({
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_completion_tokens": 1024,
+            "max_completion_tokens": 2048,
         });
         let resp = client
             .post("https://openrouter.ai/api/v1/chat/completions")
             .bearer_auth(&self.api_key)
+            .header("HTTP-Referer", "https://github.com/romiluz13/pay4what")
+            .header("X-Title", "pay4what")
             .json(&body)
             .send()?;
-        let v: serde_json::Value = resp.json()?;
-        // OpenAI-compatible: choices[0].message.content
-        let text = v
+        let status = resp.status();
+        let text = resp.text()?;
+        if !status.is_success() {
+            return Err(format!("HTTP {status}: {text}").into());
+        }
+        let v: serde_json::Value = serde_json::from_str(&text)?;
+        let msg = v
             .get("choices")
             .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
+            .and_then(|c| c.get("message"));
+        let content = msg
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                msg.and_then(|m| m.get("reasoning"))
+                    .and_then(|r| r.as_str())
+            })
             .unwrap_or("");
-        Ok(text.to_string())
+        Ok(content.to_string())
+    }
+}
+
+/// Grove gateway caller (Rom's personal gateway — OpenAI-compatible). Used when
+/// GROVE_API_KEY + GROVE_BASE_URL are set. NOT the public-path default; the
+/// published app uses OpenRouter. Grove is for Rom's local dogfooding.
+#[cfg(feature = "categorize")]
+pub struct GroveCaller {
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+}
+
+#[cfg(feature = "categorize")]
+impl LlmCaller for GroveCaller {
+    fn categorize_batch(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .user_agent("pay4what/0.1")
+            .build()?;
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_completion_tokens": 2048,
+        });
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let resp = client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .header("api-key", &self.api_key)
+            .json(&body)
+            .send()?;
+        let status = resp.status();
+        let text = resp.text()?;
+        if !status.is_success() {
+            return Err(format!("HTTP {status}: {text}").into());
+        }
+        let v: serde_json::Value = serde_json::from_str(&text)?;
+        let msg = v
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"));
+        let content = msg
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                msg.and_then(|m| m.get("reasoning"))
+                    .and_then(|r| r.as_str())
+            })
+            .unwrap_or("");
+        Ok(content.to_string())
     }
 }
 
@@ -352,9 +447,10 @@ pub fn categorize_segments(segments: &[Segment], cat: &dyn Categorizer) -> Vec<L
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        let truncated: String = s.chars().take(max).collect();
+        format!("{truncated}…")
     }
 }
