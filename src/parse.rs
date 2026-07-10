@@ -70,6 +70,24 @@ fn str_of(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
+/// Detect injected command output / version banners that Claude Code wraps into
+/// user-role text blocks but are NOT real user requests. Heuristic: a leading
+/// `$ ` shell prompt, a `Version:` banner line, or a `<command-*>` wrapper.
+/// Conservative — only filters obvious noise so real multi-line user messages
+/// (which often start with a word) pass through.
+fn looks_like_command_output(s: &str) -> bool {
+    let trimmed = s.trim_start();
+    trimmed.starts_with("$ ")
+        || trimmed.starts_with("Version:")
+        || trimmed.starts_with("<command-")
+        // multi-line where line 1 is a shell command (cd/npm/cargo/git/python)
+        && trimmed.lines().next().is_some_and(|first| {
+            let f = first.trim();
+            f.starts_with("cd ") || f.starts_with("npm ") || f.starts_with("cargo ")
+                || f.starts_with("git ") || f.starts_with("python ") || f.starts_with("node ")
+        })
+}
+
 /// Parse one JSONL line into a Turn (tolerant). Returns None for unparseable.
 fn parse_line(line: &str) -> Option<Turn> {
     let v: Value = serde_json::from_str(line).ok()?;
@@ -105,13 +123,15 @@ fn parse_line(line: &str) -> Option<Turn> {
         }
         // tool_use blocks live in message.content[]
         if let Some(content) = msg.get("content") {
-            // content can be a string (user request) or an array of blocks
+            // content can be a string (user request) or an array of blocks.
+            // Skip injected markers (<local-command-*>, <command-message>, etc.)
+            // and multi-line command output (lines starting with $ or containing
+            // 'Version:' boot lines) — these are NOT user requests.
             if let Some(s) = content.as_str() {
-                if !s.is_empty() && !s.starts_with('<') {
+                if !s.is_empty() && !s.starts_with('<') && !looks_like_command_output(s) {
                     text = Some(s.to_string());
                 }
             } else if let Some(arr) = content.as_array() {
-                // first text block (skip tool_result continuations)
                 // first text block (skip tool_result continuations AND injected
                 // local-command markers — Claude Code wraps command output/caveats
                 // in <local-command-*> tags; those are NOT user requests)
@@ -120,6 +140,8 @@ fn parse_line(line: &str) -> Option<Turn> {
                         && let Some(t) = block.get("text").and_then(|x| x.as_str())
                         && !t.is_empty()
                         && !t.starts_with("<local-command-")
+                        && !t.starts_with("<command-")
+                        && !looks_like_command_output(t)
                     {
                         text = Some(t.to_string());
                         break;

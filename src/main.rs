@@ -13,7 +13,8 @@ use clap::Parser;
     about = "See what each feature cost you in Claude Code — token spend per activity, not per session."
 )]
 struct Cli {
-    /// Show spend since this long. e.g. `7d`, `2026-07-01`. Defaults to all.
+    /// Show spend since this long. e.g. `7d`, `today`, `2026-07-01`.
+    /// Defaults to 7d (the wow window — '1 feature = N% of the week').
     #[arg(long, short = 's')]
     since: Option<String>,
 
@@ -52,7 +53,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let since = parse_since(cli.since.as_deref());
+    let since = parse_since(cli.since.as_deref().or(Some("7d")));
     let pricing = pay4what::cost::bundled_pricing();
     let mut all_labeled: Vec<pay4what::categorize::LabeledSegment> = Vec::new();
     let mut total_sessions = 0usize;
@@ -178,9 +179,12 @@ fn aggregate_json(labeled: &[pay4what::categorize::LabeledSegment]) -> serde_jso
 }
 
 /// Parse a `--since` value into a cutoff datetime.
-/// Supports: `7d` (N days ago), `2026-07-01` (absolute date).
+/// Supports: `today` (midnight today), `7d` (N days ago), `2026-07-01` (absolute).
 fn parse_since(since: Option<&str>) -> Option<chrono_like::DateTime> {
     let s = since?;
+    if s == "today" {
+        return chrono_like::today_midnight();
+    }
     // N days ago
     if let Some(days) = s.strip_suffix('d').and_then(|n| n.parse::<u64>().ok()) {
         return chrono_like::now_minus_days(days);
@@ -230,6 +234,15 @@ mod chrono_like {
             .ok()?;
         Some(DateTime {
             epoch_secs: now.as_secs() as i64 - days as i64 * 86400,
+        })
+    }
+    pub fn today_midnight() -> Option<DateTime> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        let secs = now.as_secs() as i64;
+        Some(DateTime {
+            epoch_secs: secs - (secs % 86400),
         })
     }
     pub fn parse_date(s: &str) -> Option<DateTime> {
