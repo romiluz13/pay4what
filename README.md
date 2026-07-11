@@ -54,8 +54,8 @@ pay4what --since 7d
 # also show cost-by-file
 pay4what --since 7d --files
 
-# JSON output
-pay4what --since 2026-07-01 --format json
+# query the bucket store (instant, no re-reading sessions)
+pay4what query "auth"
 ```
 
 **Zero-config:** no account, no config file, reads only local files (`~/.claude/projects/`). The LLM categorizer is optional — without a key, pay4what falls back to deterministic rules.
@@ -69,7 +69,7 @@ pay4what --since 2026-07-01 --format json
 [CodeBurn](https://github.com/getagentseal/codeburn) (8.5k★, TypeScript) is the closest competitor — it categorizes by 13 activity *types* using **deterministic regex + tool-set heuristics** (explicitly "No LLM calls, fully deterministic"). It never inspects tool arguments, edited files, or what the assistant actually did — and its keyword-order regex misclassifies ambiguous prompts (the [documented #196 bug](https://github.com/getagentseal/codeburn/issues/196): *"add error handling"* tagged as Debugging because DEBUG regex checks before FEATURE). pay4what's LLM categorizer reads the full segment context (user message + tool verbs + touched files + branch) and closes exactly that gap. CodeBurn's `yield` command binds session→commit by SHA (fragile under squash/rebase); pay4what binds to PR/branch with file-footprint attribution (v1.1).
 
 | | ccusage | CodeBurn | **pay4what** |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Per-session cost | ✅ | ✅ | ✅ |
 | Activity categorization | ❌ | ✅ deterministic regex | ✅ LLM (rules fallback) |
 | Inspects tool args / edited files | ❌ | ❌ | ✅ |
@@ -105,7 +105,7 @@ pay4what --since 2026-07-01 --format json
 ## Supported providers
 
 | Provider | Env | Default model |
-|---|---|---|
+| --- | --- | --- |
 | OpenRouter (public default) | `OPENROUTER_API_KEY` | `deepseek/deepseek-v4-flash` |
 | Any OpenAI-compatible gateway | `GROVE_API_KEY` + `GROVE_BASE_URL` | `DeepSeek-V4-Flash` |
 | Rules fallback | (none) | — |
