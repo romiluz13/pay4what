@@ -1,40 +1,48 @@
 //! pay4what — See what each feature cost you in Claude Code.
 //!
-//! Token spend per activity, not per session.
+//! Token spend per activity, not per session. Powered by LLM categorization
+//! + a persisted bucket store (incremental, queryable).
 //!
-//! v1.0: cost-by-activity + cost-by-file (high confidence). Commit/issue
-//! attribution deferred to v1.1.
-use clap::Parser;
+//! Architecture: classify segments → persist rich records {activity, tags,
+//! summary, confidence, cost} into ~/.pay4what/store.json → query the buckets
+//! at question time (no re-reading 7M tokens of raw session context).
+use clap::{Parser, Subcommand};
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     name = "pay4what",
     version,
     about = "See what each feature cost you in Claude Code — token spend per activity, not per session."
 )]
 struct Cli {
-    /// Show spend since this long. e.g. `7d`, `today`, `2026-07-01`.
-    /// Defaults to 7d (the wow window — '1 feature = N% of the week').
-    #[arg(long, short = 's')]
+    /// Show spend since this long. e.g. `7d`, `today`, `2026-07-01`. Default: 7d.
+    #[arg(long, short = 's', global = true)]
     since: Option<String>,
 
-    /// Output format: table (default), json, markdown.
-    #[arg(long, default_value = "table")]
-    format: String,
-
-    /// Categorizer model. Default: DeepSeek-V4-Flash (Grove). For OpenRouter,
-    /// pass e.g. `deepseek/deepseek-v4-flash`. Falls back to rules if no key.
-    #[arg(long, default_value = "DeepSeek-V4-Flash")]
-    model: String,
+    /// Categorizer model. Default: DeepSeek-V4-Flash (Grove) / deepseek/deepseek-v4-flash (OpenRouter).
+    #[arg(long, global = true)]
+    model: Option<String>,
 
     /// Also show the cost-by-file table.
-    #[arg(long)]
+    #[arg(long, global = true)]
     files: bool,
 
-    /// Skip the LLM categorizer (rules only). Fast, no API key needed.
-    /// Use this for quick cost totals; the LLM sharpens unattributed segments.
-    #[arg(long)]
+    /// Skip the LLM categorizer (rules only — DEGRADED MODE, no activity tags).
+    #[arg(long, global = true)]
     no_llm: bool,
+
+    /// Force re-classification of all segments (ignores the bucket cache).
+    #[arg(long, global = true)]
+    rebuild: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Query the bucket store: "how much did <phrase> cost?"
+    Query { phrase: String },
 }
 
 fn main() {
@@ -46,31 +54,50 @@ fn main() {
 }
 
 fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    match &cli.command {
+        Some(Command::Query { phrase }) => run_query(cli, phrase),
+        None => run_default(cli),
+    }
+}
+
+/// A classification job: one session's segments to classify.
+struct ClassifyJob {
+    uuid: String,
+    segments: Vec<pay4what::segment::Segment>,
+}
+
+/// Default mode: classify (incremental, parallel) + render cost-by-activity.
+fn run_default(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let sessions = pay4what::discover::discover_all();
     if sessions.is_empty() {
-        println!("No Claude Code sessions found under ~/.claude/projects.");
-        println!("Set CLAUDE_CONFIG_DIRS or run from a machine with Claude Code transcripts.");
+        eprintln!("No Claude Code sessions found under ~/.claude/projects.");
         return Ok(());
     }
 
     let since = parse_since(cli.since.as_deref().or(Some("7d")));
     let pricing = pay4what::cost::bundled_pricing();
-    let mut all_labeled: Vec<pay4what::categorize::LabeledSegment> = Vec::new();
-    let mut total_sessions = 0usize;
-    let mut total_subagent_files = 0usize;
+    let model = cli
+        .model
+        .as_deref()
+        .unwrap_or("DeepSeek-V4-Flash")
+        .to_string();
 
-    let categorizer = if cli.no_llm {
-        Box::new(pay4what::categorize::RulesCategorizer)
-            as Box<dyn pay4what::categorize::Categorizer>
-    } else {
-        pick_categorizer(&cli.model)
-    };
+    let mut store = pay4what::store::BucketStore::load();
+    if cli.rebuild {
+        eprintln!("Rebuilding: clearing all cached buckets.");
+        store = pay4what::store::BucketStore::default();
+    }
+
+    // Phase 1 (serial): parse + segment all sessions in range, collect jobs
+    // that need (re)classification.
+    let mut jobs: Vec<ClassifyJob> = Vec::new();
+    let mut total_sessions = 0usize;
+    let mut _total_subagent_files = 0usize;
 
     for session_path in &sessions {
         let Ok(session) = pay4what::parse::parse_session(session_path) else {
             continue;
         };
-        // date filter: skip sessions whose last_ts is before `since`
         if let Some(cutoff) = since
             && let Some(last) = session.last_ts.as_deref()
             && let Some(last_dt) = parse_ts(last)
@@ -80,54 +107,240 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         total_sessions += 1;
 
-        // parent session segments
+        let uuid = pay4what::store::session_uuid(session_path);
         let segments = pay4what::segment::segment_session_with_pricing(&session, &pricing);
-        let mut labeled =
-            pay4what::categorize::categorize_segments(&segments, categorizer.as_ref());
+        _total_subagent_files += pay4what::discover::discover_subagents(session_path).len();
 
-        // subagent spend (separate files, no double-count)
-        let sub_paths = pay4what::discover::discover_subagents(session_path);
-        total_subagent_files += sub_paths.len();
-        for sub_path in &sub_paths {
-            if let Ok(sub_session) = pay4what::parse::parse_session(sub_path) {
+        let already = store.classified_count(&uuid);
+        if already < segments.len() || cli.rebuild {
+            jobs.push(ClassifyJob { uuid, segments });
+        }
+
+        // subagent sessions
+        for sub_path in pay4what::discover::discover_subagents(session_path) {
+            if let Ok(sub_session) = pay4what::parse::parse_session(&sub_path) {
+                let sub_uuid = pay4what::store::session_uuid(&sub_path);
                 let sub_segs =
                     pay4what::segment::segment_session_with_pricing(&sub_session, &pricing);
-                let mut sub_labeled =
-                    pay4what::categorize::categorize_segments(&sub_segs, categorizer.as_ref());
-                labeled.append(&mut sub_labeled);
+                let sub_already = store.classified_count(&sub_uuid);
+                if sub_already < sub_segs.len() || cli.rebuild {
+                    jobs.push(ClassifyJob {
+                        uuid: sub_uuid,
+                        segments: sub_segs,
+                    });
+                }
             }
         }
-
-        all_labeled.extend(labeled);
     }
 
-    match cli.format.as_str() {
-        "json" => {
-            let json = serde_json::json!({
-                "sessions": total_sessions,
-                "subagent_files": total_subagent_files,
-                "pricing_as_of": pricing.as_of,
-                "activities": aggregate_json(&all_labeled),
-            });
-            println!("{}", serde_json::to_string_pretty(&json)?);
+    if total_sessions == 0 {
+        println!("No Claude Code sessions in range.");
+        return Ok(());
+    }
+
+    eprintln!(
+        "Classifying {} session(s) across {} jobs...",
+        total_sessions,
+        jobs.len()
+    );
+    if jobs.len() > 50 && !cli.no_llm {
+        eprintln!(
+            "⚠️  {} jobs — this will take a while. Use --no-llm for instant totals.",
+            jobs.len()
+        );
+        eprintln!("    The incremental cache means this big run only happens once.");
+    }
+
+    // Phase 2 (parallel via rayon): classify each job. Sessions are independent.
+    // rayon bounds concurrency to CPU core count (work-stealing) — prevents
+    // overwhelming the gateway with 1500 concurrent requests.
+    let results: Vec<(String, usize, Vec<pay4what::store::Bucket>)> = if cli.no_llm {
+        eprintln!("⚠️  --no-llm: rules-only degraded mode (no tags, no summaries).");
+        jobs.iter().map(classify_job_rules).collect()
+    } else {
+        use rayon::prelude::*;
+        jobs.par_iter()
+            .map(|job| classify_job_llm(job, &model))
+            .collect()
+    };
+
+    // Phase 3 (serial): merge results into the store
+    let mut total_new_segments = 0usize;
+    for (uuid, n_segs, buckets) in results {
+        total_new_segments += buckets.len();
+        store.remove_session(&uuid);
+        for b in buckets {
+            store.upsert_bucket(b);
         }
-        _ => {
-            println!(
-                "pay4what — {} sessions (+{} subagent files), pricing as-of {}",
-                total_sessions, total_subagent_files, pricing.as_of,
-            );
-            print!("{}", pay4what::render::render_activity_table(&all_labeled));
-            if cli.files {
-                print!("{}", pay4what::render::render_file_table(&all_labeled));
-            }
-        }
+        store.mark_classified(&uuid, n_segs);
+    }
+
+    eprintln!(
+        "Classified {total_new_segments} segments. Bucket store: {} buckets total.",
+        store.buckets.len()
+    );
+    store.save()?;
+
+    // Render from ALL buckets in range (not just this run's)
+    let labeled = buckets_to_labeled(&store, since);
+    print!("{}", pay4what::render::render_activity_table(&labeled));
+    if cli.files {
+        print!("{}", pay4what::render::render_file_table(&labeled));
     }
     Ok(())
 }
 
-/// Pick the categorizer: prefer Grove (Rom's personal gateway) when its env
-/// is set, else OpenRouter (the public-path default) when its key is set, else
-/// rules fallback. Published app uses OpenRouter; Grove is for local dogfooding.
+/// Classify one job using the LLM (runs in its own thread).
+fn classify_job_llm(
+    job: &ClassifyJob,
+    model: &str,
+) -> (String, usize, Vec<pay4what::store::Bucket>) {
+    let cat = pick_categorizer(model);
+    let records = cat.categorize_rich(&job.segments);
+    let buckets = job
+        .segments
+        .iter()
+        .zip(records)
+        .map(|(seg, rec)| pay4what::store::Bucket {
+            id: format!("{}:{}", job.uuid, seg.index),
+            session: job.uuid.clone(),
+            segment_index: seg.index,
+            activity: rec.activity,
+            tags: rec.tags,
+            summary: rec.summary,
+            confidence: rec.confidence,
+            cost: seg.cost,
+            tokens: seg.total_tokens(),
+            files: seg.touched_files.iter().cloned().collect(),
+            branch: seg.git_branch.clone(),
+            first_ts: seg.turns.first().and_then(|t| t.timestamp.clone()),
+            last_ts: seg.turns.last().and_then(|t| t.timestamp.clone()),
+        })
+        .collect();
+    (job.uuid.clone(), job.segments.len(), buckets)
+}
+
+/// Classify one job using rules only (instant, no LLM).
+fn classify_job_rules(job: &ClassifyJob) -> (String, usize, Vec<pay4what::store::Bucket>) {
+    let cat = pay4what::categorize::RulesCategorizer;
+    let buckets = job
+        .segments
+        .iter()
+        .map(|seg| {
+            let rec = pay4what::categorize::RichRecord {
+                activity: pay4what::categorize::Categorizer::categorize(&cat, seg),
+                tags: Vec::new(),
+                summary: seg.user_message.chars().take(80).collect(),
+                confidence: 0.0,
+            };
+            pay4what::store::Bucket {
+                id: format!("{}:{}", job.uuid, seg.index),
+                session: job.uuid.clone(),
+                segment_index: seg.index,
+                activity: rec.activity,
+                tags: rec.tags,
+                summary: rec.summary,
+                confidence: rec.confidence,
+                cost: seg.cost,
+                tokens: seg.total_tokens(),
+                files: seg.touched_files.iter().cloned().collect(),
+                branch: seg.git_branch.clone(),
+                first_ts: seg.turns.first().and_then(|t| t.timestamp.clone()),
+                last_ts: seg.turns.last().and_then(|t| t.timestamp.clone()),
+            }
+        })
+        .collect();
+    (job.uuid.clone(), job.segments.len(), buckets)
+}
+
+/// Query mode: "how much did <phrase> cost?" — hits the bucket store, no LLM.
+fn run_query(cli: &Cli, phrase: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = pay4what::store::BucketStore::load();
+    if store.buckets.is_empty() {
+        eprintln!("No buckets found. Run `pay4what --since 7d` first to classify your sessions.");
+        return Ok(());
+    }
+    let since = parse_since(cli.since.as_deref().or(Some("365d")));
+    let matches: Vec<&pay4what::store::Bucket> = store
+        .buckets
+        .iter()
+        .filter(|b| {
+            if let Some(cutoff) = since
+                && let Some(ts) = &b.last_ts
+                && let Some(dt) = parse_ts(ts)
+                && dt < cutoff
+            {
+                return false;
+            }
+            let p = phrase.to_lowercase();
+            b.summary.to_lowercase().contains(&p)
+                || b.tags.iter().any(|t| t.to_lowercase().contains(&p))
+                || b.activity.label().contains(&p)
+        })
+        .collect();
+
+    if matches.is_empty() {
+        println!("No segments matched \"{phrase}\".");
+        return Ok(());
+    }
+
+    let total: f64 = matches.iter().map(|b| b.cost).sum();
+    let total_tokens: u64 = matches.iter().map(|b| b.tokens).sum();
+    println!("\n  \"{}\" — {} segment(s)", phrase, matches.len());
+    println!("  ┌──────────────────────────────────────────────┬──────────┬────────┐");
+    println!("  │ Activity     Summary                          │ Cost     │ Tokens │");
+    println!("  ├──────────────────────────────────────────────┼──────────┼────────┤");
+    for b in &matches {
+        let act = format!("{} {}", b.activity.emoji(), b.activity.label());
+        let summary = truncate_str(&b.summary, 32);
+        println!(
+            "  │ {:<11} {:<33} │ {:>8} │ {:>6} │",
+            act,
+            summary,
+            format!("${:.2}", b.cost),
+            fmt_tokens(b.tokens)
+        );
+    }
+    println!("  ├──────────────────────────────────────────────┼──────────┼────────┤");
+    println!(
+        "  │ {:<45} │ {:>8} │ {:>6} │",
+        "TOTAL",
+        format!("${:.2}", total),
+        fmt_tokens(total_tokens)
+    );
+    println!("  └──────────────────────────────────────────────┴──────────┴────────┘");
+    Ok(())
+}
+
+fn buckets_to_labeled(
+    store: &pay4what::store::BucketStore,
+    since: Option<chrono_like::DateTime>,
+) -> Vec<pay4what::categorize::LabeledSegment> {
+    store
+        .buckets
+        .iter()
+        .filter(|b| {
+            if let Some(cutoff) = since
+                && let Some(ts) = &b.last_ts
+                && let Some(dt) = parse_ts(ts)
+                && dt < cutoff
+            {
+                return false;
+            }
+            true
+        })
+        .map(|b| pay4what::categorize::LabeledSegment {
+            index: b.segment_index,
+            activity: b.activity,
+            user_message: b.summary.clone(),
+            cost: b.cost,
+            tokens: b.tokens,
+            git_branch: b.branch.clone(),
+            touched_files: b.files.iter().cloned().collect(),
+        })
+        .collect()
+}
+
 fn pick_categorizer(model: &str) -> Box<dyn pay4what::categorize::Categorizer> {
     #[cfg(feature = "categorize")]
     {
@@ -158,47 +371,38 @@ fn pick_categorizer(model: &str) -> Box<dyn pay4what::categorize::Categorizer> {
     Box::new(pay4what::categorize::RulesCategorizer)
 }
 
-fn aggregate_json(labeled: &[pay4what::categorize::LabeledSegment]) -> serde_json::Value {
-    use std::collections::BTreeMap;
-    let mut map: BTreeMap<String, (f64, u64, usize)> = BTreeMap::new();
-    for s in labeled {
-        let e = map
-            .entry(s.activity.label().to_string())
-            .or_insert((0.0, 0, 0));
-        e.0 += s.cost;
-        e.1 += s.tokens;
-        e.2 += 1;
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
     }
-    let arr: Vec<serde_json::Value> = map
-        .into_iter()
-        .map(|(label, (cost, tokens, count))| {
-            serde_json::json!({ "activity": label, "cost_usd": (cost * 100.0).round() / 100.0, "tokens": tokens, "segments": count })
-        })
-        .collect();
-    serde_json::Value::Array(arr)
+}
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}K", n / 1_000)
+    } else {
+        n.to_string()
+    }
 }
 
-/// Parse a `--since` value into a cutoff datetime.
-/// Supports: `today` (midnight today), `7d` (N days ago), `2026-07-01` (absolute).
+// ─── date helpers ───────────────────────────────────────────────────────────
 fn parse_since(since: Option<&str>) -> Option<chrono_like::DateTime> {
     let s = since?;
     if s == "today" {
         return chrono_like::today_midnight();
     }
-    // N days ago
     if let Some(days) = s.strip_suffix('d').and_then(|n| n.parse::<u64>().ok()) {
         return chrono_like::now_minus_days(days);
     }
-    // absolute date
     chrono_like::parse_date(s)
 }
-
 fn parse_ts(s: &str) -> Option<chrono_like::DateTime> {
     chrono_like::parse_rfc3339(s)
 }
 
-/// Minimal date handling without pulling chrono — use std::time + manual parse
-/// for the RFC3339 timestamps Claude Code emits. For now, a lightweight module.
 mod chrono_like {
     #[derive(Clone, Copy)]
     pub struct DateTime {
@@ -206,15 +410,16 @@ mod chrono_like {
     }
     impl DateTime {
         fn from_ymd_hms(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> Self {
-            // days since 1970-01-01 (civil-from-days algorithm)
             let y = if mo <= 2 { y - 1 } else { y };
             let era = if y >= 0 { y } else { y - 399 } / 400;
             let yoe = (y - era * 400) as u32;
             let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
             let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-            let days = era as i64 * 146097 + doe as i64 - 719468;
             Self {
-                epoch_secs: days * 86400 + h as i64 * 3600 + mi as i64 * 60 + s as i64,
+                epoch_secs: (era as i64 * 146097 + doe as i64 - 719468) * 86400
+                    + h as i64 * 3600
+                    + mi as i64 * 60
+                    + s as i64,
             }
         }
     }
@@ -246,27 +451,31 @@ mod chrono_like {
         })
     }
     pub fn parse_date(s: &str) -> Option<DateTime> {
-        let parts: Vec<&str> = s.split('-').collect();
-        if parts.len() != 3 {
+        let p: Vec<&str> = s.split('-').collect();
+        if p.len() != 3 {
             return None;
         }
-        let y = parts[0].parse().ok()?;
-        let mo = parts[1].parse().ok()?;
-        let d = parts[2].parse().ok()?;
-        Some(DateTime::from_ymd_hms(y, mo, d, 0, 0, 0))
+        Some(DateTime::from_ymd_hms(
+            p[0].parse().ok()?,
+            p[1].parse().ok()?,
+            p[2].parse().ok()?,
+            0,
+            0,
+            0,
+        ))
     }
     pub fn parse_rfc3339(s: &str) -> Option<DateTime> {
-        // 2026-07-07T10:00:00Z or with fractional/.timezone
         let s = s.trim();
         if s.len() < 19 {
             return None;
         }
-        let y = s[0..4].parse().ok()?;
-        let mo = s[5..7].parse().ok()?;
-        let d = s[8..10].parse().ok()?;
-        let h = s[11..13].parse().ok()?;
-        let mi = s[14..16].parse().ok()?;
-        let se = s[17..19].parse().ok()?;
-        Some(DateTime::from_ymd_hms(y, mo, d, h, mi, se))
+        Some(DateTime::from_ymd_hms(
+            s[0..4].parse().ok()?,
+            s[5..7].parse().ok()?,
+            s[8..10].parse().ok()?,
+            s[11..13].parse().ok()?,
+            s[14..16].parse().ok()?,
+            s[17..19].parse().ok()?,
+        ))
     }
 }

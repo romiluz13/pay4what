@@ -5,3 +5,4 @@ pub mod discover;
 pub mod parse;
 pub mod render;
 pub mod segment;
+pub mod store;

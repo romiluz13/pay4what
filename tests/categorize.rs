@@ -105,7 +105,7 @@ impl pay4what::categorize::LlmCaller for MockCaller {
 fn llm_categorizer_parses_json_response() {
     // OpenRouter returns one label per segment (batched). Mock returns JSON array.
     let mock = MockCaller {
-        response: r#"{"labels":["feature","bugfix"]}"#.to_string(),
+        response: r#"{"results":[{"activity":"feature","tags":["auth"],"summary":"add oauth","confidence":0.9},{"activity":"bugfix","tags":["login"],"summary":"fix login","confidence":0.85}]}"#.to_string(),
     };
     let cat =
         pay4what::categorize::LlmCategorizer::new("deepseek/deepseek-v4-flash", Box::new(mock));

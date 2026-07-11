@@ -15,7 +15,19 @@ use crate::segment::Segment;
 use std::collections::BTreeSet;
 
 /// The activity categories pay4what attributes spend to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    Default,
+)]
 pub enum Activity {
     Feature,
     Bugfix,
@@ -24,6 +36,7 @@ pub enum Activity {
     Debugging,
     Exploration,
     Planning,
+    #[default]
     Unattributed,
 }
 
@@ -83,12 +96,38 @@ pub struct LabeledSegment {
     pub touched_files: BTreeSet<String>,
 }
 
+/// Rich LLM categorization record — one per segment. The full output that goes
+/// into the bucket store: not just an activity label, but tags + summary +
+/// confidence. This is what makes the bucket queryable ("how much did the
+/// login bug cost?" -> match on tags+summary).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct RichRecord {
+    pub activity: Activity,
+    pub tags: Vec<String>,
+    pub summary: String,
+    pub confidence: f64,
+}
+
 /// Categorizer trait — rules or LLM both implement this.
 pub trait Categorizer {
     fn categorize(&self, segment: &Segment) -> Activity;
     /// Categorize a batch (default: per-segment; LLM overrides to batch).
     fn categorize_batch(&self, segments: &[Segment]) -> Vec<Activity> {
         segments.iter().map(|s| self.categorize(s)).collect()
+    }
+    /// Categorize with rich output {activity, tags, summary, confidence}.
+    /// Default: rules-only records (no tags, no real summary, confidence=0).
+    /// LLM overrides this to read the full session arc in one call.
+    fn categorize_rich(&self, segments: &[Segment]) -> Vec<RichRecord> {
+        segments
+            .iter()
+            .map(|s| RichRecord {
+                activity: self.categorize(s),
+                tags: Vec::new(),
+                summary: s.user_message.chars().take(80).collect(),
+                confidence: 0.0,
+            })
+            .collect()
     }
 }
 
@@ -202,7 +241,7 @@ impl Categorizer for RulesCategorizer {
 // ─── LLM categorizer (OpenRouter, mockable caller) ─────────────────────────
 
 /// Abstracts the OpenRouter HTTP call so tests can inject a mock.
-pub trait LlmCaller {
+pub trait LlmCaller: Send {
     /// Given a prompt, return the raw response text (JSON: {"labels":[...]}).
     fn categorize_batch(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error>>;
 }
@@ -224,26 +263,45 @@ impl LlmCategorizer {
         }
     }
 
-    /// Build the OpenRouter prompt for a batch of segments.
+    /// Build the LLM prompt for a session's segments. One call per session —
+    /// the LLM sees the FULL arc (user messages + tool verbs + files + branch +
+    /// assistant text replies) so it can detect topic pivots and compaction
+    /// boundaries. Returns rich records {activity, tags, summary, confidence}.
     pub fn build_prompt(&self, segments: &[Segment]) -> String {
         let items: Vec<String> = segments
             .iter()
-            .map(|s| {
+            .enumerate()
+            .map(|(i, s)| {
                 let files: Vec<String> = s.touched_files.iter().take(8).cloned().collect();
                 let verbs: Vec<String> = s.tool_verbs.iter().cloned().collect();
+                // collect the first assistant text reply in the segment
+                let assistant_text = s
+                    .turns
+                    .iter()
+                    .filter(|t| t.kind.as_deref() == Some("assistant"))
+                    .find_map(|t| t.text.as_ref().map(|t| truncate(t, 200)))
+                    .unwrap_or_default();
                 format!(
-                    "- user: {:?} | branch: {:?} | tools: {} | files: {}",
+                    "[{}] user: {:?} | branch: {:?} | tools: {} | files: {} | assistant: {:?}",
+                    i + 1,
                     truncate(&s.user_message, 300),
                     s.git_branch,
                     verbs.join(","),
                     files.join(","),
+                    assistant_text,
                 )
             })
             .collect();
         format!(
-            "Categorize each development segment by activity. Respond as JSON: {{\"labels\":[\"feature\",\"bugfix\",...]}}\n\
-             Allowed labels: feature, bugfix, migration, refactor, debugging, exploration, planning, unattributed.\n\
-             Segments:\n{}",
+            "Categorize each segment of this Claude Code session. For EACH segment return a JSON object with:\n\
+             - activity: one of feature, bugfix, migration, refactor, debugging, exploration, planning, unattributed\n\
+             - tags: 1-3 short lowercase keywords (e.g. [\"auth\",\"oauth\"])\n\
+             - summary: one-line description of what this segment actually did\n\
+             - confidence: 0.0 to 1.0\n\
+             Read the full arc — sessions pivot topics mid-stream. If a segment starts as feature work but\n\
+             becomes debugging, label it by what the segment ACTUALLY did.\n\
+             Segments:\n{}\n\
+             Return JSON: {{\"results\":[{{\"activity\":\"feature\",\"tags\":[\"auth\"],\"summary\":\"implement oauth\",\"confidence\":0.9}}, ...]}}",
             items.join("\n")
         )
     }
@@ -285,6 +343,114 @@ impl LlmCategorizer {
         // Last resort: split by comma/newline (rarely reached now).
         text.split([',', '\n']).map(Activity::parse).collect()
     }
+
+    /// Parse a rich LLM response ({"results":[{activity,tags,summary,confidence},...]})
+    /// into a Vec<RichRecord>. Strips code fences + extracts the JSON block.
+    /// Falls back to empty vec on parse failure (caller falls back to rules).
+    pub fn parse_rich(text: &str) -> Vec<RichRecord> {
+        let text = text.trim();
+        let text = text
+            .strip_prefix("```")
+            .map(|t| t.strip_prefix("json").unwrap_or(t).trim_start())
+            .unwrap_or(text);
+        let text = text
+            .strip_suffix("```")
+            .map(|t| t.trim_end())
+            .unwrap_or(text);
+        let json_str = if let Some(start) = text.find('{')
+            && let Some(end) = text.rfind('}')
+            && start < end
+        {
+            &text[start..=end]
+        } else {
+            return Vec::new();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else {
+            return Vec::new();
+        };
+        let Some(arr) = v.get("results").and_then(|l| l.as_array()) else {
+            return Vec::new();
+        };
+        arr.iter()
+            .map(|obj| {
+                let activity = obj
+                    .get("activity")
+                    .and_then(|a| a.as_str())
+                    .map(Activity::parse)
+                    .unwrap_or(Activity::Unattributed);
+                let tags = obj
+                    .get("tags")
+                    .and_then(|t| t.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|t| t.as_str())
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let summary = obj
+                    .get("summary")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let confidence = obj
+                    .get("confidence")
+                    .and_then(|c| c.as_f64())
+                    .unwrap_or(0.5);
+                RichRecord {
+                    activity,
+                    tags,
+                    summary,
+                    confidence,
+                }
+            })
+            .collect()
+    }
+
+    /// Categorize all segments, returning rich records {activity, tags, summary,
+    /// confidence}. The LLM sees the full session arc. Chunked at 20 segments
+    /// per call to keep prompts manageable (a 50-segment session = 3 calls).
+    /// Every segment goes through the LLM — no rules-pre-tagging (the LLM IS
+    /// the product). Falls back to rules-only records on error or count mismatch.
+    pub fn categorize_rich(&self, segments: &[Segment]) -> Vec<RichRecord> {
+        if segments.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(segments.len());
+        for chunk in segments.chunks(20) {
+            let prompt = self.build_prompt(chunk);
+            let records = match self.caller.categorize_batch(&prompt) {
+                Ok(text) => {
+                    let parsed = Self::parse_rich(&text);
+                    if parsed.len() == chunk.len() {
+                        parsed
+                    } else {
+                        // count mismatch — rules fallback for this chunk
+                        chunk
+                            .iter()
+                            .map(|s| RichRecord {
+                                activity: self.rules.categorize(s),
+                                tags: Vec::new(),
+                                summary: s.user_message.chars().take(80).collect(),
+                                confidence: 0.0,
+                            })
+                            .collect()
+                    }
+                }
+                Err(_) => chunk
+                    .iter()
+                    .map(|s| RichRecord {
+                        activity: self.rules.categorize(s),
+                        tags: Vec::new(),
+                        summary: s.user_message.chars().take(80).collect(),
+                        confidence: 0.0,
+                    })
+                    .collect(),
+            };
+            out.extend(records);
+        }
+        out
+    }
 }
 
 impl Categorizer for LlmCategorizer {
@@ -295,53 +461,13 @@ impl Categorizer for LlmCategorizer {
     }
 
     fn categorize_batch(&self, segments: &[Segment]) -> Vec<Activity> {
-        if segments.is_empty() {
-            return Vec::new();
-        }
-        // Cost saver + latency fix: rules-pre-tag obvious segments (feat/ branch,
-        // "fix" keyword, read-only tools) and send ONLY the rules-unattributed
-        // segments to the LLM. This cuts LLM calls ~5-10x — a 7d run drops from
-        // >5min to <60s — without contorting the categorizer around a slow model.
-        // The LLM still sees every AMBIGUOUS segment in full context; rules-confident
-        // segments don't need it (they're unambiguous by definition).
-        let rule_labels: Vec<Activity> =
-            segments.iter().map(|s| self.rules.categorize(s)).collect();
-        let ambiguous: Vec<Segment> = segments
-            .iter()
-            .zip(rule_labels.iter())
-            .filter(|(_, a)| **a == Activity::Unattributed)
-            .map(|(s, _)| s.clone())
-            .collect();
-        if ambiguous.is_empty() {
-            return rule_labels;
-        }
-        // batch ambiguous segments in chunks of 20
-        let mut llm_labels: Vec<Activity> = Vec::with_capacity(ambiguous.len());
-        for chunk in ambiguous.chunks(20) {
-            let prompt = self.build_prompt(chunk);
-            let labels = match self.caller.categorize_batch(&prompt) {
-                Ok(text) => {
-                    let parsed = Self::parse_labels(&text);
-                    if parsed.len() == chunk.len() {
-                        parsed
-                    } else {
-                        chunk.iter().map(|s| self.rules.categorize(s)).collect()
-                    }
-                }
-                Err(_) => chunk.iter().map(|s| self.rules.categorize(s)).collect(),
-            };
-            llm_labels.extend(labels);
-        }
-        // merge LLM labels back into the rule_labels at the ambiguous positions
-        let mut merged = rule_labels;
-        let mut li = 0;
-        for a in merged.iter_mut() {
-            if *a == Activity::Unattributed && li < llm_labels.len() {
-                *a = llm_labels[li];
-                li += 1;
-            }
-        }
-        merged
+        // Delegate to categorize_rich — the LLM sees every segment in full arc
+        // context and returns rich records. We extract just the activity here.
+        // No rules-pre-tagging: the LLM IS the product (user's explicit call).
+        self.categorize_rich(segments)
+            .into_iter()
+            .map(|r| r.activity)
+            .collect()
     }
 }
 
