@@ -411,7 +411,9 @@ impl LlmCategorizer {
     /// confidence}. The LLM sees the full session arc. Chunked at 20 segments
     /// per call to keep prompts manageable (a 50-segment session = 3 calls).
     /// Every segment goes through the LLM — no rules-pre-tagging (the LLM IS
-    /// the product). Falls back to rules-only records on error or count mismatch.
+    /// the product). On count mismatch, USES the records that DID parse and
+    /// fills gaps with rules (partial-result handling). On error, full rules
+    /// fallback for the chunk.
     pub fn categorize_rich(&self, segments: &[Segment]) -> Vec<RichRecord> {
         if segments.is_empty() {
             return Vec::new();
@@ -425,29 +427,47 @@ impl LlmCategorizer {
                     if parsed.len() == chunk.len() {
                         parsed
                     } else {
-                        // count mismatch — rules fallback for this chunk
-                        chunk
-                            .iter()
-                            .map(|s| RichRecord {
-                                activity: self.rules.categorize(s),
-                                tags: Vec::new(),
-                                summary: s.user_message.chars().take(80).collect(),
-                                confidence: 0.0,
-                            })
-                            .collect()
+                        // count mismatch — use partial results + rules-fill gaps
+                        Self::merge_partial(chunk, &parsed, &self.rules)
                     }
                 }
                 Err(_) => chunk
                     .iter()
-                    .map(|s| RichRecord {
-                        activity: self.rules.categorize(s),
-                        tags: Vec::new(),
-                        summary: s.user_message.chars().take(80).collect(),
-                        confidence: 0.0,
-                    })
+                    .map(|s| self.rules_fallback_record(s))
                     .collect(),
             };
             out.extend(records);
+        }
+        out
+    }
+
+    /// Build a rules-fallback record for a segment (no tags, summary = user msg).
+    fn rules_fallback_record(&self, seg: &Segment) -> RichRecord {
+        RichRecord {
+            activity: self.rules.categorize(seg),
+            tags: Vec::new(),
+            summary: seg.user_message.chars().take(80).collect(),
+            confidence: 0.0,
+        }
+    }
+
+    /// Merge partial LLM results with rules-filled gaps.
+    /// Uses the first `min(parsed.len(), chunk.len())` LLM records, fills the
+    /// rest with rules fallback. Never discards parsed LLM data.
+    fn merge_partial(
+        chunk: &[Segment],
+        parsed: &[RichRecord],
+        rules: &RulesCategorizer,
+    ) -> Vec<RichRecord> {
+        let usable = parsed.len().min(chunk.len());
+        let mut out: Vec<RichRecord> = parsed[..usable].to_vec();
+        for seg in &chunk[usable..] {
+            out.push(RichRecord {
+                activity: rules.categorize(seg),
+                tags: Vec::new(),
+                summary: seg.user_message.chars().take(80).collect(),
+                confidence: 0.0,
+            });
         }
         out
     }
@@ -468,6 +488,11 @@ impl Categorizer for LlmCategorizer {
             .into_iter()
             .map(|r| r.activity)
             .collect()
+    }
+
+    fn categorize_rich(&self, segments: &[Segment]) -> Vec<RichRecord> {
+        // Delegate to the inherent impl (which has the partial-result logic).
+        LlmCategorizer::categorize_rich(self, segments)
     }
 }
 

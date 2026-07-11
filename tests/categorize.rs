@@ -133,3 +133,66 @@ fn llm_categorizer_falls_back_on_unparseable_response() {
     // unparseable LLM response -> fall back to rules; rules see no signal -> unattributed
     assert_eq!(labeled[0].activity, Activity::Unattributed);
 }
+
+// ─── Count-mismatch partial-result handling ────────────────────────────────
+
+/// A mock caller that returns an error, simulating a timeout or network failure.
+struct ErrMockCaller;
+impl pay4what::categorize::LlmCaller for ErrMockCaller {
+    fn categorize_batch(&self, _prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+        Err("simulated timeout".into())
+    }
+}
+
+#[test]
+fn count_mismatch_uses_partial_results() {
+    // LLM returns 3 records for 5 segments — the 3 that parsed should be USED,
+    // the 2 gaps filled with rules (not all 5 discarded).
+    let mock = MockCaller {
+        response: r#"{"results":[
+            {"activity":"feature","tags":["auth"],"summary":"add oauth","confidence":0.9},
+            {"activity":"bugfix","tags":["login"],"summary":"fix login","confidence":0.85},
+            {"activity":"refactor","tags":["billing"],"summary":"extract billing","confidence":0.8}
+        ]}"#
+            .to_string(),
+    };
+    let cat =
+        pay4what::categorize::LlmCategorizer::new("deepseek/deepseek-v4-flash", Box::new(mock));
+    let segs = seg_of(&[
+        r#"{"type":"user","timestamp":"2026-07-07T10:00:00Z","gitBranch":"main","message":{"role":"user","content":"add oauth"}}"#,
+        r#"{"type":"user","timestamp":"2026-07-07T10:01:00Z","gitBranch":"main","message":{"role":"user","content":"fix login"}}"#,
+        r#"{"type":"user","timestamp":"2026-07-07T10:02:00Z","gitBranch":"main","message":{"role":"user","content":"extract billing"}}"#,
+        r#"{"type":"user","timestamp":"2026-07-07T10:03:00Z","gitBranch":"main","message":{"role":"user","content":"do something else"}}"#,
+        r#"{"type":"user","timestamp":"2026-07-07T10:04:00Z","gitBranch":"main","message":{"role":"user","content":"and another thing"}}"#,
+    ]);
+    let records = pay4what::categorize::Categorizer::categorize_rich(&cat, &segs);
+    assert_eq!(records.len(), 5, "should return 5 records (3 LLM + 2 rules-fill)");
+    // first 3 are from LLM — have tags + summaries
+    assert_eq!(records[0].tags, vec!["auth"], "record 0 should have LLM tags");
+    assert_eq!(records[0].summary, "add oauth");
+    assert_eq!(records[1].tags, vec!["login"]);
+    assert_eq!(records[2].tags, vec!["billing"]);
+    // last 2 are rules-filled — empty tags, summary = user message
+    assert!(records[3].tags.is_empty(), "record 3 should be rules-filled (no tags)");
+    assert!(records[4].tags.is_empty(), "record 4 should be rules-filled (no tags)");
+}
+
+#[test]
+fn llm_error_falls_back_to_rules_for_chunk() {
+    // LLM call errors (e.g. timeout) -> all records rules-filled, no panic.
+    let cat = pay4what::categorize::LlmCategorizer::new(
+        "deepseek/deepseek-v4-flash",
+        Box::new(ErrMockCaller),
+    );
+    let segs = seg_of(&[
+        r#"{"type":"user","timestamp":"2026-07-07T10:00:00Z","gitBranch":"main","message":{"role":"user","content":"do something"}}"#,
+        r#"{"type":"user","timestamp":"2026-07-07T10:01:00Z","gitBranch":"main","message":{"role":"user","content":"do another thing"}}"#,
+        r#"{"type":"user","timestamp":"2026-07-07T10:02:00Z","gitBranch":"main","message":{"role":"user","content":"and a third"}}"#,
+        r#"{"type":"user","timestamp":"2026-07-07T10:03:00Z","gitBranch":"main","message":{"role":"user","content":"fourth task"}}"#,
+        r#"{"type":"user","timestamp":"2026-07-07T10:04:00Z","gitBranch":"main","message":{"role":"user","content":"fifth task"}}"#,
+    ]);
+    let records = pay4what::categorize::Categorizer::categorize_rich(&cat, &segs);
+    assert_eq!(records.len(), 5, "error should produce 5 rules-filled records");
+    assert!(records[0].tags.is_empty(), "error fallback should have no tags");
+    assert!(records[4].tags.is_empty());
+}
