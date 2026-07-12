@@ -1,11 +1,12 @@
 # pay4what
 
-**See what each feature cost you in Claude Code — token spend per activity, not per session.**
+**You spent $3,000 on Claude Code last month. What did you actually ship?**
 
-`pay4what` reads Claude Code's local JSONL transcripts, computes cost per turn (cache-aware), segments by user request, and uses an LLM to categorize every segment by development activity — so you see *"the OAuth feature cost $47, the login bugfix cost $3"* instead of *"Edit tool: $74"*.
+`pay4what` tells you exactly what each feature, bugfix, and refactor cost you — not "you used 47M tokens" or "Edit tool: $74." It reads your local Claude Code transcripts, computes real costs (cache-aware), and uses an LLM to categorize every segment of work by what you actually **did**.
 
 ```
 $ pay4what --since 7d
+
   ┌──────────────────────────────────────────────┬──────────┬────────┐
   │ Activity                                      │ Cost     │ Tokens │
   ├──────────────────────────────────────────────┼──────────┼────────┤
@@ -17,105 +18,100 @@ $ pay4what --since 7d
   ├──────────────────────────────────────────────┼──────────┼────────┤
   │ TOTAL                                         │  $72.10  │ 4.9M   │
   └──────────────────────────────────────────────┴──────────┴────────┘
+
   💸 1 feature = 65% of the week's spend.
+
+$ pay4what query "login"
+  "login" — 3 segment(s)
+  TOTAL  $3.40  220K
 ```
 
-## Why
+## The problem
 
-The industry is shouting pay4what's exact question — *"Token Billing Exposes AI's Missing ROI"* (Forbes). 78% of companies hit surprise AI bills (Beri); Uber burned their 2026 AI budget in 4 months. Existing tools tell you **how much** you spent, or **which tool** ran. None tell you **what you shipped and what it cost**.
+You open your AI bill and see **$3,000**. No breakdown by feature. No idea which task burned the most. Was it the auth migration? The debugging spiral? The 2-hour exploration that went nowhere?
 
-> **ccusage tells you HOW MUCH. CodeBurn tells you WHICH TOOL. pay4what tells you WHAT YOU SHIPPED and what it cost.**
+Existing tools tell you **how much** you spent (ccusage) or **which tool** ran (CodeBurn). None tell you **what you shipped and what it cost**. You're left guessing whether that 3-day debugging session was worth $400 or $4.
 
-The unit of attribution is a **shippable artifact** (a feature/PR/ticket), not a tool or a session. A 90-minute Edit/Bash/Edit retry loop becomes *"the auth migration that ate $47"* — not *"Edit tool calls."*
+78% of companies exceed their AI budgets. Uber burned their entire 2026 AI budget in 4 months. The money is spent — the question is **where it went and whether it was worth it**.
+
+## The solution
+
+pay4what attributes every dollar of token spend to a **development activity** — feature, bugfix, migration, refactor, debugging, exploration, planning — not a tool name or a session ID.
+
+**How it works:**
+
+1. **Reads** your local Claude Code transcripts (`~/.claude/projects/`) — nothing leaves your machine
+2. **Computes** real cost per turn, cache-aware (separates cache reads from fresh input, prices each at its own rate)
+3. **Segments** work by user request — the unit of development, not the unit of API calls
+4. **Categorizes** each segment with an LLM that reads the full context (user message + tool verbs + files touched + branch + assistant replies) — not regex guessing
+5. **Persists** rich records `{activity, tags, summary, cost}` into a local bucket store
+6. **Answers questions**: "how much did the login bug cost?" → instant dollar sum, no re-processing
+
+## The value
+
+- **See where the money goes**: "65% of this week's spend was one feature" — the insight that changes how you build
+- **Query by topic**: `pay4what query "auth"` → $47 across 12 segments, instantly
+- **Zero config**: reads only local files, no account, no API key required for basic totals
+- **Sharp categorization**: LLM reads what you actually did, not just keywords. Unattributed drops from ~60% (rules) to ~25% (LLM)
+- **Incremental**: classifies new segments only. Second run is instant
+- **Private**: your transcripts never leave your machine. The LLM categorizer is optional and uses your own API key
 
 ## Install
 
 ```bash
-# cargo
 cargo install pay4what
-
-# npx (planned)
-npx pay4what --since 7d
-
-# brew (planned)
-brew install pay4what
 ```
 
 ## Usage
 
 ```bash
-# fast cost totals (no API key, deterministic rules categorizer)
+# fast cost totals (no API key needed — deterministic rules categorizer)
 pay4what --since 7d --no-llm
 
 # LLM-categorized (sharpens unattributed from ~60% → ~25%)
-export GROVE_API_KEY=...        # or OPENROUTER_API_KEY
+export OPENROUTER_API_KEY=...        # or any OpenAI-compatible gateway
 pay4what --since 7d
-
-# also show cost-by-file
-pay4what --since 7d --files
 
 # query the bucket store (instant, no re-reading sessions)
 pay4what query "auth"
+
+# also show cost-by-file
+pay4what --since 7d --files
 ```
 
-**Zero-config:** no account, no config file, reads only local files (`~/.claude/projects/`). The LLM categorizer is optional — without a key, pay4what falls back to deterministic rules.
-
-## vs ccusage
-
-[ccusage](https://github.com/ccusage/ccusage) (16.9k★, Rust) is the viral zero-config Claude Code cost monitor. pay4what shares its transcript-discovery + tolerant-parse + pricing approach, but **ccusage reports per-session/per-project totals only** — it does not categorize spend by activity, does not touch git, and does not attribute cost to features/PRs/tickets. If you want *"how much did I spend today?"*, use ccusage. If you want *"what did that spend buy me?"*, use pay4what.
-
-## vs CodeBurn
-
-[CodeBurn](https://github.com/getagentseal/codeburn) (8.5k★, TypeScript) is the closest competitor — it categorizes by 13 activity *types* using **deterministic regex + tool-set heuristics** (explicitly "No LLM calls, fully deterministic"). It never inspects tool arguments, edited files, or what the assistant actually did — and its keyword-order regex misclassifies ambiguous prompts (the [documented #196 bug](https://github.com/getagentseal/codeburn/issues/196): *"add error handling"* tagged as Debugging because DEBUG regex checks before FEATURE). pay4what's LLM categorizer reads the full segment context (user message + tool verbs + touched files + branch) and closes exactly that gap. CodeBurn's `yield` command binds session→commit by SHA (fragile under squash/rebase); pay4what binds to PR/branch with file-footprint attribution (v1.1).
+## vs other tools
 
 | | ccusage | CodeBurn | **pay4what** |
 | --- | --- | --- | --- |
-| Per-session cost | ✅ | ✅ | ✅ |
-| Activity categorization | ❌ | ✅ deterministic regex | ✅ LLM (rules fallback) |
+| What it tells you | How much you spent | Which tool ran | **What you shipped and what it cost** |
+| Activity categorization | ❌ | regex only | ✅ LLM (reads full context) |
 | Inspects tool args / edited files | ❌ | ❌ | ✅ |
-| Cost per named feature/PR/ticket | ❌ | ❌ | ✅ (v1.1 commit/issue) |
+| Query by topic ("how much did auth cost?") | ❌ | ❌ | ✅ |
 | Subagent spend separation | ❌ | ✅ | ✅ |
-| Cross-vendor (Cursor/Aider/Codex) | ❌ | partial | planned |
+| Private (local files only) | ✅ | ✅ | ✅ |
 
-## How it works
+> **ccusage** (16.9k★) is excellent for "how much did I spend today?" **CodeBurn** (8.5k★) categorizes by tool type with deterministic regex. **pay4what** is the only tool that reads what you actually did and tells you what it cost — per feature, per bugfix, per refactor.
 
-```
-~/.claude/projects/<enc-cwd>/<uuid>.jsonl
-        │
-   discover → parse (tolerant) → cost (cache-aware) → segment (user-turns)
-        │                                              → categorize (LLM or rules)
-        │                                              → file attribution
-        ▼
-   cost-by-activity table + cost-by-file table
-```
+## Categorization
 
-- **Discovery:** resolves `CLAUDE_CONFIG_DIRS` + `~/.claude/projects`, finds top-level sessions **and** subagent transcripts (`<uuid>/subagents/agent-*.jsonl`). No double-count — parent and subagent are physically separate files.
-- **Tolerant parse:** streams JSONL, handles the volatile schema (Anthropic #53516), captures `input_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens` **separately** (never double-counts), including the 5m/1h cache-creation split.
-- **Cache-aware cost:** prices each token bucket at its own rate. 1h cache-creation priced at `2.0× input` (per Anthropic's pricing model). Bundled pricing table is versioned + `asOf`-dated, sourced from [docs.claude.com/pricing](https://docs.claude.com/en/docs/about-claude/pricing).
-- **Chunked-turn dedup:** Claude Code emits one logical turn as multiple JSONL lines (thinking + text + tool_use) sharing cumulative usage. pay4what counts each logical turn once (verified: a 27K-turn session had 10,648 usage lines → 4,998 logical turns; without dedup, 113% inflation).
-- **Segmentation:** splits at user-turn boundaries (the unit of categorization), with compact boundaries.
-- **Categorization:** LLM-primary (DeepSeek V4 Flash via OpenRouter by default — any OpenAI-compatible gateway works). Batches 20 segments/call. Falls back to deterministic rules (branch name + keywords + tool verbs) when no API key is set.
-- **File attribution:** from Edit/Write tool inputs; memory/session bookkeeping files excluded.
+8 activities: `feature` · `bugfix` · `migration` · `refactor` · `debugging` · `exploration` · `planning` · `unattributed`
 
-## Categorization: LLM-primary, rules fallback
+**With an API key:** every segment goes through the LLM with full context (user message + tools + files + branch + assistant text). ~$0.005/session at DeepSeek V4 Flash rates. Falls back to rules on any error or timeout — never blocks.
 
-- **With `OPENROUTER_API_KEY` (or `GROVE_API_KEY`):** every segment goes through the LLM with full context. ~$0.005/session at DeepSeek V4 Flash rates. In practice, unattributed drops from ~60% (rules) to ~25% (LLM).
-- **Without a key (`--no-llm` or no env):** deterministic rules categorize via branch name (`feat/`→feature, `fix/`→bugfix), user-message keywords, and tool verbs. Instant, zero-cost, ~60% unattributed.
-
-## Supported providers
+**Without a key:** deterministic rules categorize via branch name (`feat/`→feature, `fix/`→bugfix), user-message keywords, and tool verbs. Instant, zero-cost, ~60% unattributed.
 
 | Provider | Env | Default model |
 | --- | --- | --- |
-| OpenRouter (public default) | `OPENROUTER_API_KEY` | `deepseek/deepseek-v4-flash` |
+| OpenRouter | `OPENROUTER_API_KEY` | `deepseek/deepseek-v4-flash` |
 | Any OpenAI-compatible gateway | `GROVE_API_KEY` + `GROVE_BASE_URL` | `DeepSeek-V4-Flash` |
 | Rules fallback | (none) | — |
 
-## Limitations (honest)
+## Technical details
 
-- **Claude Code first.** Cursor per-turn tokens aren't locally accessible (marked "limited"). Codex/Aider/Cline formats are roadmap.
-- **cost-by-commit / cost-by-issue are v1.1.** v1.0 ships cost-by-activity + cost-by-file (high confidence). Commit attribution is probabilistic (binds to PR/branch, never SHA — SHAs are fragile under squash/rebase).
-- **Pricing is a bundled snapshot.** Verify against `docs.claude.com/pricing` before publishing dollar claims (pay4what's rates are `asOf`-dated for this reason).
-- **Categorization accuracy is not 100%.** pay4what shows an `unattributed` bucket rather than faking precision.
+- **Cache-aware cost**: prices each token bucket at its own rate (input, output, cache_read, cache_creation 5m/1h). 1h cache-creation priced at 2.0× input per Anthropic's model. Pricing byte-verified against LiteLLM.
+- **Chunked-turn dedup**: Claude Code emits one logical turn as multiple JSONL lines (thinking + text + tool_use) sharing cumulative usage. pay4what counts each logical turn once — without this, costs are inflated ~2×.
+- **Subagent spend**: discovers and separates subagent transcripts (`<uuid>/subagents/agent-*.jsonl`) — no double-counting between parent and child.
+- **Partial-result handling**: when the LLM returns fewer records than segments (e.g. 18 for 20), pay4what uses the 18 that parsed and fills gaps with rules — never discards good data.
 
 ## License
 
