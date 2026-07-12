@@ -1,30 +1,14 @@
 # pay4what
 
+![CI](https://github.com/romiluz13/pay4what/actions/workflows/ci.yml/badge.svg)
+![crates.io](https://img.shields.io/crates/v/pay4what.svg)
+![license](https://img.shields.io/badge/license-MIT-blue.svg)
+
 **You spent $3,000 on Claude Code last month. What did you actually ship?**
 
 `pay4what` tells you exactly what each feature, bugfix, and refactor cost you — not "you used 47M tokens" or "Edit tool: $74." It reads your local Claude Code transcripts, computes real costs (cache-aware), and uses an LLM to categorize every segment of work by what you actually **did**.
 
-```
-$ pay4what --since 7d
-
-  ┌──────────────────────────────────────────────┬──────────┬────────┐
-  │ Activity                                      │ Cost     │ Tokens │
-  ├──────────────────────────────────────────────┼──────────┼────────┤
-  │ 🚀 feature   OAuth refresh-token rotation      │  $47.20  │  3.1M  │
-  │ 🐛 bugfix     login redirect loop              │   $3.40  │  220K  │
-  │ 📦 migration  Prisma 5 → 6 schema bump         │  $12.80  │  880K  │
-  │ ♻️  refactor   extract billing service          │   $6.10  │  410K  │
-  │ ❓ unattributed (small / interrupted)           │   $2.60  │  175K  │
-  ├──────────────────────────────────────────────┼──────────┼────────┤
-  │ TOTAL                                         │  $72.10  │ 4.9M   │
-  └──────────────────────────────────────────────┴──────────┴────────┘
-
-  💸 1 feature = 65% of the week's spend.
-
-$ pay4what query "login"
-  "login" — 3 segment(s)
-  TOTAL  $3.40  220K
-```
+![pay4what demo](pay4what-demo.gif)
 
 ## The problem
 
@@ -105,6 +89,13 @@ pay4what --since 7d --files
 | OpenRouter | `OPENROUTER_API_KEY` | `deepseek/deepseek-v4-flash` |
 | Any OpenAI-compatible gateway | `GROVE_API_KEY` + `GROVE_BASE_URL` | `DeepSeek-V4-Flash` |
 | Rules fallback | (none) | — |
+
+## Limitations
+
+- **Claude Code only.** Reads `~/.claude/projects/` transcripts. Cursor, Codex, and Aider support are on the roadmap.
+- **Cost-by-commit / cost-by-PR are v1.1.** v1.0 ships cost-by-activity + cost-by-file. Commit attribution binds to branch (not SHA — SHAs are fragile under squash/rebase).
+- **Pricing is a bundled snapshot** (dated 2026-07-08, byte-verified against LiteLLM). Verify against [docs.claude.com/pricing](https://docs.claude.com/en/docs/about-claude/pricing) before publishing dollar claims.
+- **Categorization is not 100%.** pay4what shows an `unattributed` bucket rather than faking precision.
 
 ## Technical details
 
